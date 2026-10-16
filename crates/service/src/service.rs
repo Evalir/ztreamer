@@ -454,6 +454,13 @@ impl CompactService {
         if !nullifiers && pools.is_all() {
             self.range_as(request, |record: EncodedBlockRecord| record.block)
                 .await
+        } else if !pools.transparent {
+            let blocks = self
+                .range_as(request, move |record: EncodedBlockRecord| {
+                    project_encoded_block(record.block, pools, nullifiers)
+                })
+                .await?;
+            Ok(Box::pin(blocks.map(|block| block.and_then(|block| block))))
         } else {
             Ok(Box::pin(
                 self.range_inner(request, nullifiers)
