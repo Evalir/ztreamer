@@ -25,8 +25,8 @@ use ztreamer_node::NodeClient;
 use crate::telemetry::{ObservedSource, ServiceMetrics};
 
 use crate::serve::{
-    PoolSelection, add_transparent_txs, compact_mempool_txs, excluded_txids, project_block,
-    project_encoded,
+    Envelope, PoolSelection, add_transparent_txs, compact_mempool_txs, excluded_txids,
+    project_block, project_encoded,
 };
 use ztreamer_indexer::{
     Digest,
@@ -428,12 +428,12 @@ impl CompactService {
         request: proto::BlockId,
         nullifiers: bool,
     ) -> Result<EncodedCompactBlock, Status> {
-        let block = self.record_as::<EncodedBlockRecord>(request).await?.block;
+        let record = self.record_as::<EncodedBlockRecord>(request).await?;
         if nullifiers {
             let pools = PoolSelection::from_request(&[]).expect("empty pool selection is valid");
-            return project_encoded_block(block, pools, true);
+            return project_record(record, pools, true);
         }
-        Ok(block)
+        Ok(record.block)
     }
 
     pub(crate) async fn encoded_range(
@@ -457,10 +457,15 @@ impl CompactService {
         } else if !pools.transparent {
             let blocks = self
                 .range_as(request, move |record: EncodedBlockRecord| {
-                    project_encoded_block(record.block, pools, nullifiers)
+                    project_record(record, pools, nullifiers)
                 })
                 .await?;
-            Ok(Box::pin(blocks.map(|block| block.and_then(|block| block))))
+            // Like a failed index read, an invalid record ends the stream.
+            let mut failed = false;
+            Ok(Box::pin(blocks.map_while(move |block| {
+                let block = block.and_then(|block| block);
+                (!std::mem::replace(&mut failed, block.is_err())).then_some(block)
+            })))
         } else {
             Ok(Box::pin(
                 self.range_inner(request, nullifiers)
@@ -1199,21 +1204,36 @@ fn mempool_compact(
     compact_mempool_txs(&transactions, pools, &[])
 }
 
-/// Projects without decoding when the block is in the index's canonical layout.
-fn project_encoded_block(
-    block: EncodedCompactBlock,
+/// Projects without decoding when the record has the index's canonical layout, and
+/// otherwise decodes it with the same checks as [`ProtobufBlockRecord`].
+fn project_record(
+    record: EncodedBlockRecord,
     pools: PoolSelection,
     nullifiers: bool,
 ) -> Result<EncodedCompactBlock, Status> {
-    if let Some(projected) = block
+    let envelope = Envelope {
+        height: record.height,
+        hash: &record.hash,
+        previous_hash: &record.previous_hash,
+    };
+    if let Some(projected) = record
+        .block
         .as_encoded()
-        .and_then(|bytes| project_encoded(bytes, pools, nullifiers))
+        .and_then(|bytes| project_encoded(bytes, envelope, pools, nullifiers))
     {
-        return Ok(EncodedCompactBlock::from_encoded(projected.into()));
+        return Ok(EncodedCompactBlock::from_encoded(projected));
     }
-    let block = block
-        .into_decoded()
-        .map_err(|_| index_status(IndexError::Codec(CodecError::InvalidRecord)))?;
+    // Never taken for records the index writes; count it so layout drift is visible.
+    metrics::counter!("ztreamer.serve.projection.fallback").increment(1);
+    let invalid = || index_status(IndexError::Codec(CodecError::InvalidRecord));
+    let block = record.block.into_decoded().map_err(|_| invalid())?;
+    if block.height != u64::from(record.height)
+        || block.hash != record.hash
+        || block.prev_hash != record.previous_hash
+        || block.chain_metadata.is_none()
+    {
+        return Err(invalid());
+    }
     Ok(project_block(block, pools, nullifiers).into())
 }
 

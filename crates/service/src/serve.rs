@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use prost::bytes::Bytes;
 use tonic::Status;
 use zakura_chain::{serialization::ZcashDeserialize as _, transaction};
 use ztreamer_indexer::{
@@ -101,163 +102,265 @@ pub(crate) fn project_block(
     block
 }
 
-/// [`project_block`] for an encoded block, without decoding it: the result is the same
-/// bytes as decoding, projecting and re-encoding. Returns `None` for anything other than
-/// the canonical layout the index writes, so callers can fall back to decoding.
+/// The block identity stored beside an encoded payload, which the payload must repeat.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Envelope<'a> {
+    pub(crate) height: u32,
+    pub(crate) hash: &'a Digest,
+    pub(crate) previous_hash: &'a Digest,
+}
+
+/// [`project_block`] for an encoded block, without decoding it.
+///
+/// Accepts only the exact layout the index writes: prost's canonical encoding (one-byte
+/// keys, minimal varints, no zero scalars, fields in tag order) with 32- and 52-byte
+/// shielded fields. `Some(out)` therefore means that decoding `block` succeeds, that it
+/// repeats `envelope` and has chain metadata (the checks the decoding path makes), and
+/// that `out` is the encoding of the projected block. When nothing is removed, `out` is
+/// `block` itself. Anything else returns `None` so the caller can decode instead.
 pub(crate) fn project_encoded(
-    block: &[u8],
+    block: &Bytes,
+    envelope: Envelope<'_>,
     pools: PoolSelection,
     nullifiers: bool,
-) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(block.len());
-    let mut tx = Vec::new();
+) -> Option<Bytes> {
+    let (len, changed) = walk_block(block, envelope, pools, nullifiers, None)?;
+    if !changed {
+        return Some(block.clone());
+    }
+    let mut out = Vec::with_capacity(len);
+    walk_block(block, envelope, pools, nullifiers, Some(&mut out))?;
+    debug_assert_eq!(out.len(), len);
+    Some(out.into())
+}
+
+const NULLIFIER_FIELD: usize = 2 + 32;
+const CHAIN_METADATA_FIELD: u8 = 8 << 3 | 2;
+
+/// Validates `block` and returns the projected length and whether it differs from the
+/// input, writing the projection to `out` when given.
+fn walk_block(
+    mut block: &[u8],
+    envelope: Envelope<'_>,
+    pools: PoolSelection,
+    nullifiers: bool,
+    mut out: Option<&mut Vec<u8>>,
+) -> Option<(usize, bool)> {
+    let (mut len, mut changed) = (0, nullifiers);
+    let (mut height, mut hash, mut previous_hash, mut metadata) = (0, None, None, false);
     let mut previous = 0;
-    for field in Fields(block) {
-        let field = field?;
-        // Prost writes fields in tag order, with repeated transactions together.
+    while !block.is_empty() {
+        let field = next_field(&mut block)?;
+        // Tag order; only transactions repeat.
         if field.number < previous || (field.number == previous && field.number != 7) {
             return None;
         }
         previous = field.number;
-        if field.value.is_some() != matches!(field.number, 3 | 4 | 6 | 7 | 8) {
-            return None;
-        }
-        match field.number {
-            2..=6 => out.extend_from_slice(field.raw),
-            7 => {
-                tx.clear();
-                if project_tx(
-                    field.value.expect("checked above"),
-                    pools,
-                    nullifiers,
-                    &mut tx,
-                )? {
-                    put_message(&mut out, 7, &tx);
+        match (field.number, field.value) {
+            (2, Value::Varint(value)) if value != 0 => height = value,
+            (3, Value::Bytes(value)) => hash = Some(value),
+            (4, Value::Bytes(value)) => previous_hash = Some(value),
+            (5, Value::Varint(value)) if value != 0 && value <= u64::from(u32::MAX) => {}
+            (6, Value::Bytes(value)) if !value.is_empty() => {}
+            (7, Value::Bytes(tx)) => {
+                let projected = project_tx(tx, pools, nullifiers, None)?;
+                changed |= projected.changed || !projected.keep;
+                if projected.keep {
+                    len += 1
+                        + prost::encoding::encoded_len_varint(projected.len as u64)
+                        + projected.len;
+                    if let Some(out) = out.as_deref_mut() {
+                        out.push(field.raw[0]);
+                        prost::encoding::encode_varint(projected.len as u64, out);
+                        project_tx(tx, pools, nullifiers, Some(out))?;
+                    }
+                }
+                continue;
+            }
+            (8, Value::Bytes(value)) if is_chain_metadata(value) => {
+                metadata = true;
+                if nullifiers {
+                    continue;
                 }
             }
-            8 if nullifiers => {}
-            8 => out.extend_from_slice(field.raw),
             _ => return None,
         }
+        len += field.raw.len();
+        if let Some(out) = out.as_deref_mut() {
+            out.extend_from_slice(field.raw);
+        }
+    }
+    if height != u64::from(envelope.height)
+        || hash != Some(envelope.hash.as_slice())
+        || previous_hash != Some(envelope.previous_hash.as_slice())
+        || !metadata
+    {
+        return None;
     }
     if nullifiers {
-        put_message(&mut out, 8, &[]);
+        // project_block replaces chain metadata with an empty message, which is last.
+        len += 2;
+        if let Some(out) = out {
+            out.extend_from_slice(&[CHAIN_METADATA_FIELD, 0]);
+        }
     }
-    Some(out)
+    Some((len, changed))
 }
 
-/// Writes the projected transaction and reports whether [`project_block`] would keep it.
+struct ProjectedTx {
+    len: usize,
+    /// Whether [`project_block`] keeps the transaction.
+    keep: bool,
+    /// Whether the kept transaction differs from its input.
+    changed: bool,
+}
+
 fn project_tx(
-    tx: &[u8],
+    mut tx: &[u8],
     pools: PoolSelection,
     nullifiers: bool,
-    out: &mut Vec<u8>,
-) -> Option<bool> {
-    // CompactTx tag order (1-6, then 9); vin/vout (7, 8) never occur in the compact index.
-    const ORDER: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 0, 0, 7];
+    mut out: Option<&mut Vec<u8>>,
+) -> Option<ProjectedTx> {
+    let (mut len, mut shielded, mut changed) = (0, false, false);
     let mut previous = 0;
-    let mut shielded = false;
-    for field in Fields(tx) {
-        let field = field?;
-        let rank = *ORDER
-            .get(field.number as usize)
-            .filter(|rank| **rank != 0)?;
+    while !tx.is_empty() {
+        let field = next_field(&mut tx)?;
+        // Tag order is 1-6 then 9; vin/vout (7, 8) never occur in the compact index.
+        let rank = match field.number {
+            1..=6 => field.number,
+            9 => 7,
+            _ => return None,
+        };
         if rank < previous || (rank == previous && rank < 4) {
             return None;
         }
         previous = rank;
-        if field.value.is_some() == matches!(field.number, 1 | 3) {
-            return None;
-        }
-        let keep = match field.number {
-            1..=3 => {
-                out.extend_from_slice(field.raw);
-                continue;
-            }
-            4 => pools.sapling,
-            5 => pools.sapling && !nullifiers,
-            6 => pools.orchard,
-            9 => pools.ironwood,
-            _ => unreachable!("ranked above"),
+        let keep = match (field.number, field.value) {
+            (1, Value::Varint(value)) if value != 0 => true,
+            (2, Value::Bytes(value)) if !value.is_empty() => true,
+            (3, Value::Varint(value)) if value != 0 && value <= u64::from(u32::MAX) => true,
+            (4, Value::Bytes(value)) if is_spend(value) => pools.sapling,
+            (5, Value::Bytes(value)) if is_output(value) => pools.sapling && !nullifiers,
+            (6, Value::Bytes(value)) if is_action(value) => pools.orchard,
+            (9, Value::Bytes(value)) if is_action(value) => pools.ironwood,
+            _ => return None,
         };
         if !keep {
+            changed = true;
             continue;
         }
-        shielded = true;
-        if nullifiers && matches!(field.number, 6 | 9) {
-            let mut nullifier: &[u8] = &[];
-            for action_field in Fields(field.value?) {
-                let action_field = action_field?;
-                if action_field.value.is_none() || !(1..=4).contains(&action_field.number) {
-                    return None;
-                }
-                if action_field.number == 1 {
-                    nullifier = action_field.raw;
-                }
+        shielded |= field.number >= 4;
+        if let (true, 6 | 9, Value::Bytes(action)) = (nullifiers, field.number, field.value) {
+            // project_block keeps only the nullifier, the action's first field.
+            changed = true;
+            len += 2 + NULLIFIER_FIELD;
+            if let Some(out) = out.as_deref_mut() {
+                out.extend_from_slice(&[field.raw[0], NULLIFIER_FIELD as u8]);
+                out.extend_from_slice(&action[..NULLIFIER_FIELD]);
             }
-            put_message(out, field.number, nullifier);
         } else {
-            out.extend_from_slice(field.raw);
+            len += field.raw.len();
+            if let Some(out) = out.as_deref_mut() {
+                out.extend_from_slice(field.raw);
+            }
         }
     }
-    Some(shielded || nullifiers)
+    Some(ProjectedTx {
+        len,
+        keep: shielded || nullifiers,
+        changed,
+    })
 }
 
-fn put_message(out: &mut Vec<u8>, number: u32, message: &[u8]) {
-    prost::encoding::encode_key(number, prost::encoding::WireType::LengthDelimited, out);
-    prost::encoding::encode_varint(message.len() as u64, out);
-    out.extend_from_slice(message);
+// The index's fixed layouts: every field present, 32 bytes except 52-byte ciphertexts.
+fn is_spend(value: &[u8]) -> bool {
+    has_layout(value, &[(0x0a, 32)])
 }
 
-/// One varint or length-delimited protobuf field.
+fn is_output(value: &[u8]) -> bool {
+    has_layout(value, &[(0x0a, 32), (0x12, 32), (0x1a, 52)])
+}
+
+fn is_action(value: &[u8]) -> bool {
+    has_layout(value, &[(0x0a, 32), (0x12, 32), (0x1a, 32), (0x22, 52)])
+}
+
+fn has_layout(mut value: &[u8], fields: &[(u8, u8)]) -> bool {
+    fields.iter().all(|&(key, len)| {
+        let field_len = 2 + usize::from(len);
+        let matches = value.len() >= field_len && value[0] == key && value[1] == len;
+        if matches {
+            value = &value[field_len..];
+        }
+        matches
+    }) && value.is_empty()
+}
+
+/// Canonical `ChainMetadata`: uint32 fields 1-3 in order, each nonzero.
+fn is_chain_metadata(mut value: &[u8]) -> bool {
+    let mut previous = 0;
+    while !value.is_empty() {
+        match next_field(&mut value) {
+            Some(Field {
+                number: number @ 1..=3,
+                value: Value::Varint(size),
+                ..
+            }) if number > previous && size != 0 && size <= u64::from(u32::MAX) => {
+                previous = number;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+enum Value<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+}
+
+/// One canonically encoded varint or length-delimited field.
 struct Field<'a> {
-    number: u32,
+    number: u8,
     /// The field including its key, for copying verbatim.
     raw: &'a [u8],
-    /// A length-delimited field's contents.
-    value: Option<&'a [u8]>,
+    value: Value<'a>,
 }
 
-/// Iterates fields, yielding `None` on malformed input or other wire types.
-struct Fields<'a>(&'a [u8]);
-
-impl<'a> Iterator for Fields<'a> {
-    type Item = Option<Field<'a>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.0.is_empty() {
-            return None;
-        }
-        let start = self.0;
-        let field = (|| {
-            let (number, wire_type) = prost::encoding::decode_key(&mut self.0).ok()?;
-            let value = match wire_type {
-                prost::encoding::WireType::Varint => {
-                    prost::encoding::decode_varint(&mut self.0).ok()?;
-                    None
-                }
-                prost::encoding::WireType::LengthDelimited => {
-                    let len = usize::try_from(prost::encoding::decode_varint(&mut self.0).ok()?)
-                        .ok()
-                        .filter(|len| *len <= self.0.len())?;
-                    let (value, rest) = self.0.split_at(len);
-                    self.0 = rest;
-                    Some(value)
-                }
-                _ => return None,
-            };
-            Some(Field {
-                number,
-                raw: &start[..start.len() - self.0.len()],
-                value,
-            })
-        })();
-        if field.is_none() {
-            // Stop after malformed input.
-            self.0 = &[];
-        }
-        Some(field)
+/// Reads one field, or `None` for anything prost would not have written.
+fn next_field<'a>(reader: &mut &'a [u8]) -> Option<Field<'a>> {
+    let start = *reader;
+    let key = *reader.first()?;
+    // Every field number in this schema is below 16, so canonical keys are one byte.
+    if key >= 0x80 {
+        return None;
     }
+    *reader = &reader[1..];
+    let value = match key & 7 {
+        0 => Value::Varint(canonical_varint(reader)?),
+        2 => {
+            let len = usize::try_from(canonical_varint(reader)?).ok()?;
+            if len > reader.len() {
+                return None;
+            }
+            let (value, rest) = reader.split_at(len);
+            *reader = rest;
+            Value::Bytes(value)
+        }
+        _ => return None,
+    };
+    Some(Field {
+        number: key >> 3,
+        raw: &start[..start.len() - reader.len()],
+        value,
+    })
+}
+
+fn canonical_varint(reader: &mut &[u8]) -> Option<u64> {
+    let before = reader.len();
+    let value = prost::encoding::decode_varint(reader).ok()?;
+    (before - reader.len() == prost::encoding::encoded_len_varint(value)).then_some(value)
 }
 
 pub(crate) fn add_transparent_txs(
@@ -487,10 +590,60 @@ mod tests {
         },
     };
 
-    #[test]
-    fn encoded_projection_is_byte_identical_to_decoding() {
+    /// The decoding path [`project_encoded`] replaces: decode, make the checks
+    /// `ProtobufBlockRecord::decode` makes, project and re-encode.
+    fn decoded_projection(
+        encoded: &[u8],
+        envelope: Envelope<'_>,
+        pools: PoolSelection,
+        nullifiers: bool,
+    ) -> Option<Vec<u8>> {
         use prost::Message as _;
 
+        let block = proto::CompactBlock::decode(encoded).ok()?;
+        (block.height == u64::from(envelope.height)
+            && block.hash == envelope.hash
+            && block.prev_hash == envelope.previous_hash
+            && block.chain_metadata.is_some())
+        .then(|| project_block(block, pools, nullifiers).encode_to_vec())
+    }
+
+    /// Every pool selection, with and without nullifier projection.
+    fn selections() -> Vec<(PoolSelection, bool)> {
+        let pools = [
+            proto::PoolType::Sapling,
+            proto::PoolType::Orchard,
+            proto::PoolType::Ironwood,
+        ];
+        (0..8u8)
+            .flat_map(|mask| {
+                let selected = pools
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| mask & (1 << bit) != 0)
+                    .map(|(_, pool)| *pool as i32)
+                    .collect::<Vec<_>>();
+                let selection = PoolSelection::from_request(&selected).unwrap();
+                [(selection, false), (selection, true)]
+            })
+            .collect()
+    }
+
+    fn record_envelope(record: &CompactBlockRecord) -> Envelope<'_> {
+        Envelope {
+            height: record.height,
+            hash: &record.hash,
+            previous_hash: &record.previous_hash,
+        }
+    }
+
+    fn encode_record(record: &CompactBlockRecord) -> Bytes {
+        use prost::Message as _;
+        record.to_proto().encode_to_vec().into()
+    }
+
+    #[test]
+    fn encoded_projection_is_byte_identical_to_decoding() {
         let mut records: Vec<CompactBlockRecord> =
             [&*BLOCK_MAINNET_949496_BYTES, &*BLOCK_TESTNET_1842421_BYTES]
                 .into_iter()
@@ -547,37 +700,20 @@ mod tests {
             end_tree_sizes: TreeSizes::default(),
         });
 
-        let pool_sets: [&[proto::PoolType]; 8] = [
-            &[],
-            &[proto::PoolType::Sapling],
-            &[proto::PoolType::Orchard],
-            &[proto::PoolType::Ironwood],
-            &[proto::PoolType::Sapling, proto::PoolType::Orchard],
-            &[proto::PoolType::Orchard, proto::PoolType::Ironwood],
-            &[proto::PoolType::Sapling, proto::PoolType::Ironwood],
-            &[
-                proto::PoolType::Ironwood,
-                proto::PoolType::Sapling,
-                proto::PoolType::Orchard,
-            ],
-        ];
         for record in &records {
-            let encoded = record.to_proto().encode_to_vec();
-            for pools in pool_sets {
-                let pools = pools.iter().map(|pool| *pool as i32).collect::<Vec<_>>();
-                let pools = PoolSelection::from_request(&pools).unwrap();
-                for nullifiers in [false, true] {
-                    let expected = project_block(
-                        proto::CompactBlock::decode(encoded.as_slice()).unwrap(),
-                        pools,
-                        nullifiers,
-                    )
-                    .encode_to_vec();
-                    assert_eq!(
-                        project_encoded(&encoded, pools, nullifiers),
-                        Some(expected),
-                        "{pools:?} nullifiers={nullifiers}"
-                    );
+            let encoded = encode_record(record);
+            let envelope = record_envelope(record);
+            for (pools, nullifiers) in selections() {
+                let actual = project_encoded(&encoded, envelope, pools, nullifiers)
+                    .expect("index records take the fast path");
+                assert_eq!(
+                    Some(actual.to_vec()),
+                    decoded_projection(&encoded, envelope, pools, nullifiers),
+                    "{pools:?} nullifiers={nullifiers}"
+                );
+                if pools.is_all() && !nullifiers {
+                    // Nothing is removed, so the stored bytes are returned without a copy.
+                    assert_eq!(actual.as_ptr(), encoded.as_ptr());
                 }
             }
         }
@@ -607,6 +743,10 @@ mod tests {
             }
         }
 
+        fn digest<const N: usize>(&mut self) -> [u8; N] {
+            std::array::from_fn(|_| self.next() as u8)
+        }
+
         /// Any length, including empty, so nothing depends on the index's fixed widths.
         fn bytes(&mut self) -> Vec<u8> {
             let len = match self.below(4) {
@@ -620,111 +760,197 @@ mod tests {
         fn count(&mut self) -> usize {
             self.below(4) as usize
         }
+
+        /// A record shaped like the index's, including payload-less transactions.
+        fn record(&mut self) -> CompactBlockRecord {
+            let action = |rng: &mut Rng| CompactShieldedAction {
+                nullifier: rng.digest(),
+                commitment: rng.digest(),
+                ephemeral_key: rng.digest(),
+                ciphertext: rng.digest(),
+            };
+            CompactBlockRecord {
+                height: self.scalar() as u32,
+                hash: self.digest(),
+                previous_hash: self.digest(),
+                time: self.scalar() as u32,
+                transactions: (0..self.below(5))
+                    .map(|_| CompactTransaction {
+                        index: self.scalar(),
+                        txid: self.digest(),
+                        sapling_spends: (0..self.count()).map(|_| self.digest()).collect(),
+                        sapling_outputs: (0..self.count())
+                            .map(|_| CompactSaplingOutput {
+                                cmu: self.digest(),
+                                ephemeral_key: self.digest(),
+                                ciphertext: self.digest(),
+                            })
+                            .collect(),
+                        orchard_actions: (0..self.count()).map(|_| action(self)).collect(),
+                        ironwood_actions: (0..self.count()).map(|_| action(self)).collect(),
+                    })
+                    .collect(),
+                end_tree_sizes: TreeSizes {
+                    sapling: self.scalar() as u32,
+                    orchard: self.scalar() as u32,
+                    ironwood: self.scalar() as u32,
+                },
+            }
+        }
     }
 
     #[test]
-    fn encoded_projection_matches_decoding_on_random_blocks() {
+    fn encoded_projection_takes_the_fast_path_for_every_index_record() {
+        let mut rng = Rng(20_261_016);
+        for _ in 0..3_000 {
+            let record = rng.record();
+            let encoded = encode_record(&record);
+            let envelope = record_envelope(&record);
+            for (pools, nullifiers) in selections() {
+                assert_eq!(
+                    project_encoded(&encoded, envelope, pools, nullifiers).map(|out| out.to_vec()),
+                    Some(decoded_projection(&encoded, envelope, pools, nullifiers).unwrap()),
+                    "{record:?} {pools:?} nullifiers={nullifiers}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_projection_agrees_with_decoding_whenever_it_answers() {
         use prost::Message as _;
 
-        let mut rng = Rng(20_261_016);
-        let pool_types = [
-            proto::PoolType::Sapling,
-            proto::PoolType::Orchard,
-            proto::PoolType::Ironwood,
-        ];
-        for _ in 0..3_000 {
+        let mut rng = Rng(7);
+        let (mut answered, mut declined) = (0, 0);
+        let mut check = |encoded: &Bytes, envelope: Envelope<'_>| {
+            for (pools, nullifiers) in selections() {
+                match project_encoded(encoded, envelope, pools, nullifiers) {
+                    Some(actual) => {
+                        answered += 1;
+                        assert_eq!(
+                            Some(actual.to_vec()),
+                            decoded_projection(encoded, envelope, pools, nullifiers),
+                            "{encoded:02x?} {pools:?} nullifiers={nullifiers}"
+                        );
+                    }
+                    None => declined += 1,
+                }
+            }
+        };
+
+        // Arbitrary blocks, beyond anything the index writes.
+        for _ in 0..1_000 {
             let action = |rng: &mut Rng| proto::CompactOrchardAction {
                 nullifier: rng.bytes(),
                 cmx: rng.bytes(),
                 ephemeral_key: rng.bytes(),
                 ciphertext: rng.bytes(),
             };
-            let vtx = (0..rng.below(5))
-                .map(|_| proto::CompactTx {
-                    index: rng.scalar(),
-                    txid: rng.bytes(),
-                    fee: rng.scalar() as u32,
-                    spends: (0..rng.count())
-                        .map(|_| proto::CompactSaplingSpend { nf: rng.bytes() })
-                        .collect(),
-                    outputs: (0..rng.count())
-                        .map(|_| proto::CompactSaplingOutput {
-                            cmu: rng.bytes(),
-                            ephemeral_key: rng.bytes(),
-                            ciphertext: rng.bytes(),
-                        })
-                        .collect(),
-                    actions: (0..rng.count()).map(|_| action(&mut rng)).collect(),
-                    ironwood_actions: (0..rng.count()).map(|_| action(&mut rng)).collect(),
-                    // The compact index never stores transparent data.
-                    vin: Vec::new(),
-                    vout: Vec::new(),
-                })
-                .collect();
             let block = proto::CompactBlock {
                 height: rng.scalar(),
                 hash: rng.bytes(),
                 prev_hash: rng.bytes(),
                 time: rng.scalar() as u32,
-                header: if rng.below(4) == 0 {
-                    rng.bytes()
-                } else {
-                    Vec::new()
-                },
-                vtx,
-                chain_metadata: match rng.below(3) {
-                    0 => None,
-                    1 => Some(proto::ChainMetadata::default()),
-                    _ => Some(proto::ChainMetadata {
-                        sapling_commitment_tree_size: rng.scalar() as u32,
-                        orchard_commitment_tree_size: rng.scalar() as u32,
-                        ironwood_commitment_tree_size: rng.scalar() as u32,
-                    }),
-                },
+                header: rng.bytes(),
+                vtx: (0..rng.below(4))
+                    .map(|_| proto::CompactTx {
+                        index: rng.scalar(),
+                        txid: rng.bytes(),
+                        fee: rng.scalar() as u32,
+                        spends: (0..rng.count())
+                            .map(|_| proto::CompactSaplingSpend { nf: rng.bytes() })
+                            .collect(),
+                        outputs: (0..rng.count())
+                            .map(|_| proto::CompactSaplingOutput {
+                                cmu: rng.bytes(),
+                                ephemeral_key: rng.bytes(),
+                                ciphertext: rng.bytes(),
+                            })
+                            .collect(),
+                        actions: (0..rng.count()).map(|_| action(&mut rng)).collect(),
+                        ironwood_actions: (0..rng.count()).map(|_| action(&mut rng)).collect(),
+                        vin: Vec::new(),
+                        vout: Vec::new(),
+                    })
+                    .collect(),
+                chain_metadata: (rng.below(4) != 0).then(|| proto::ChainMetadata {
+                    sapling_commitment_tree_size: rng.scalar() as u32,
+                    orchard_commitment_tree_size: rng.scalar() as u32,
+                    ironwood_commitment_tree_size: rng.scalar() as u32,
+                }),
             };
-            let encoded = block.encode_to_vec();
-            for mask in 0..8u8 {
-                let pools = pool_types
-                    .iter()
-                    .enumerate()
-                    .filter(|(bit, _)| mask & (1 << bit) != 0)
-                    .map(|(_, pool)| *pool as i32)
-                    .collect::<Vec<_>>();
-                let pools = PoolSelection::from_request(&pools).unwrap();
-                for nullifiers in [false, true] {
-                    let expected = project_block(block.clone(), pools, nullifiers).encode_to_vec();
-                    assert_eq!(
-                        project_encoded(&encoded, pools, nullifiers),
-                        Some(expected),
-                        "{block:?} {pools:?} nullifiers={nullifiers}"
-                    );
+            let digest = |bytes: &[u8]| -> Digest {
+                std::array::from_fn(|i| bytes.get(i).copied().unwrap_or(0))
+            };
+            let (hash, previous_hash) = (digest(&block.hash), digest(&block.prev_hash));
+            let envelope = Envelope {
+                height: block.height as u32,
+                hash: &hash,
+                previous_hash: &previous_hash,
+            };
+            check(&block.encode_to_vec().into(), envelope);
+        }
+
+        // Index records with corrupted bytes: flipped, replaced, inserted, removed or cut.
+        for _ in 0..3_000 {
+            let record = rng.record();
+            let mut bytes = encode_record(&record).to_vec();
+            for _ in 0..=rng.below(3) {
+                if bytes.is_empty() {
+                    break;
+                }
+                let at = rng.below(bytes.len() as u64) as usize;
+                match rng.below(5) {
+                    0 => bytes[at] ^= 1 << rng.below(8),
+                    1 => bytes[at] = rng.next() as u8,
+                    2 => bytes.insert(at, rng.next() as u8),
+                    3 => {
+                        bytes.remove(at);
+                    }
+                    _ => bytes.truncate(at),
                 }
             }
+            check(&bytes.into(), record_envelope(&record));
         }
+        // Both outcomes occur, so neither half of the property holds vacuously.
+        assert!(
+            answered > 5_000 && declined > 5_000,
+            "{answered} {declined}"
+        );
     }
 
     #[test]
-    fn encoded_projection_declines_non_canonical_input() {
+    fn encoded_projection_declines_non_canonical_or_invalid_input() {
         use prost::Message as _;
 
-        let pools = PoolSelection::from_request(&[]).unwrap();
         let block = proto::CompactBlock {
             height: 1,
             hash: vec![1; 32],
+            prev_hash: vec![2; 32],
+            time: 3,
             vtx: vec![proto::CompactTx {
                 index: 1,
                 txid: vec![2; 32],
                 actions: vec![proto::CompactOrchardAction {
                     nullifier: vec![3; 32],
-                    ..Default::default()
+                    cmx: vec![4; 32],
+                    ephemeral_key: vec![5; 32],
+                    ciphertext: vec![6; 52],
                 }],
                 ..Default::default()
             }],
             chain_metadata: Some(proto::ChainMetadata::default()),
             ..Default::default()
         };
+        let (hash, previous_hash) = ([1; 32], [2; 32]);
+        let envelope = Envelope {
+            height: 1,
+            hash: &hash,
+            previous_hash: &previous_hash,
+        };
+        let pools = PoolSelection::from_request(&[]).unwrap();
         let encoded = block.encode_to_vec();
-        assert!(project_encoded(&encoded, pools, true).is_some());
+        assert!(project_encoded(&encoded.clone().into(), envelope, pools, true).is_some());
 
         let with_vin = proto::CompactBlock {
             vtx: vec![proto::CompactTx {
@@ -733,22 +959,69 @@ mod tests {
             }],
             ..block.clone()
         };
-        // Height (field 2, two bytes) moved after chain metadata.
-        let reordered = [&encoded[2..], &encoded[..2]].concat();
-        let mut unknown = encoded.clone();
-        unknown.extend_from_slice(&[0x48, 1]);
-        let mut wrong_type = encoded.clone();
-        wrong_type[0] = 0x12;
-        for input in [
-            with_vin.encode_to_vec(),
-            reordered,
-            unknown,
-            wrong_type,
-            encoded[..encoded.len() - 1].to_vec(),
-        ] {
+        let with = |bytes: &[u8]| [&encoded[..], bytes].concat();
+        let cases: [(&str, Vec<u8>); 11] = [
+            ("vin", with_vin.encode_to_vec()),
+            // Height (field 2, two bytes) moved after chain metadata.
+            ("out of order", [&encoded[2..], &encoded[..2]].concat()),
+            ("unknown field", with(&[0x48, 1])),
+            ("wrong wire type", [&[0x12][..], &encoded[1..]].concat()),
+            ("truncated", encoded[..encoded.len() - 1].to_vec()),
+            (
+                "overlong varint",
+                [&[0x10, 0x81, 0x00][..], &encoded[2..]].concat(),
+            ),
+            // Time (field 5) is bytes 70..72, after height and both hashes.
+            (
+                "explicit zero",
+                [&encoded[..70], &[0x28, 0][..], &encoded[72..]].concat(),
+            ),
+            ("bad nested output", {
+                let mut tx = proto::CompactTx::default().encode_to_vec();
+                tx.extend_from_slice(&[0x2a, 2, 0x0f, 1]);
+                let mut bytes = encoded[..encoded.len() - 2].to_vec();
+                bytes.push(0x3a);
+                bytes.push(tx.len() as u8);
+                bytes.extend_from_slice(&tx);
+                bytes.extend_from_slice(&[0x42, 0]);
+                bytes
+            }),
+            (
+                "bad chain metadata",
+                [&encoded[..encoded.len() - 2], &[0x42, 1, 0xff]].concat(),
+            ),
+            ("no chain metadata", encoded[..encoded.len() - 2].to_vec()),
+            (
+                "explicit empty metadata field",
+                [&encoded[..encoded.len() - 1], &[2, 0x08, 0]].concat(),
+            ),
+        ];
+        for (name, input) in cases {
+            let input: Bytes = input.into();
             for nullifiers in [false, true] {
-                assert_eq!(project_encoded(&input, pools, nullifiers), None);
+                assert!(
+                    project_encoded(&input, envelope, pools, nullifiers).is_none(),
+                    "{name}"
+                );
             }
+        }
+
+        let other = [9; 32];
+        for envelope in [
+            Envelope {
+                height: 2,
+                ..envelope
+            },
+            Envelope {
+                hash: &other,
+                ..envelope
+            },
+            Envelope {
+                previous_hash: &other,
+                ..envelope
+            },
+        ] {
+            assert!(project_encoded(&encoded.clone().into(), envelope, pools, false).is_none());
         }
     }
 
