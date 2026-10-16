@@ -101,6 +101,165 @@ pub(crate) fn project_block(
     block
 }
 
+/// [`project_block`] for an encoded block, without decoding it: the result is the same
+/// bytes as decoding, projecting and re-encoding. Returns `None` for anything other than
+/// the canonical layout the index writes, so callers can fall back to decoding.
+pub(crate) fn project_encoded(
+    block: &[u8],
+    pools: PoolSelection,
+    nullifiers: bool,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(block.len());
+    let mut tx = Vec::new();
+    let mut previous = 0;
+    for field in Fields(block) {
+        let field = field?;
+        // Prost writes fields in tag order, with repeated transactions together.
+        if field.number < previous || (field.number == previous && field.number != 7) {
+            return None;
+        }
+        previous = field.number;
+        if field.value.is_some() != matches!(field.number, 3 | 4 | 6 | 7 | 8) {
+            return None;
+        }
+        match field.number {
+            2..=6 => out.extend_from_slice(field.raw),
+            7 => {
+                tx.clear();
+                if project_tx(
+                    field.value.expect("checked above"),
+                    pools,
+                    nullifiers,
+                    &mut tx,
+                )? {
+                    put_message(&mut out, 7, &tx);
+                }
+            }
+            8 if nullifiers => {}
+            8 => out.extend_from_slice(field.raw),
+            _ => return None,
+        }
+    }
+    if nullifiers {
+        put_message(&mut out, 8, &[]);
+    }
+    Some(out)
+}
+
+/// Writes the projected transaction and reports whether [`project_block`] would keep it.
+fn project_tx(
+    tx: &[u8],
+    pools: PoolSelection,
+    nullifiers: bool,
+    out: &mut Vec<u8>,
+) -> Option<bool> {
+    // CompactTx tag order (1-6, then 9); vin/vout (7, 8) never occur in the compact index.
+    const ORDER: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 0, 0, 7];
+    let mut previous = 0;
+    let mut shielded = false;
+    for field in Fields(tx) {
+        let field = field?;
+        let rank = *ORDER
+            .get(field.number as usize)
+            .filter(|rank| **rank != 0)?;
+        if rank < previous || (rank == previous && rank < 4) {
+            return None;
+        }
+        previous = rank;
+        if field.value.is_some() == matches!(field.number, 1 | 3) {
+            return None;
+        }
+        let keep = match field.number {
+            1..=3 => {
+                out.extend_from_slice(field.raw);
+                continue;
+            }
+            4 => pools.sapling,
+            5 => pools.sapling && !nullifiers,
+            6 => pools.orchard,
+            9 => pools.ironwood,
+            _ => unreachable!("ranked above"),
+        };
+        if !keep {
+            continue;
+        }
+        shielded = true;
+        if nullifiers && matches!(field.number, 6 | 9) {
+            let mut nullifier: &[u8] = &[];
+            for action_field in Fields(field.value?) {
+                let action_field = action_field?;
+                if action_field.value.is_none() || !(1..=4).contains(&action_field.number) {
+                    return None;
+                }
+                if action_field.number == 1 {
+                    nullifier = action_field.raw;
+                }
+            }
+            put_message(out, field.number, nullifier);
+        } else {
+            out.extend_from_slice(field.raw);
+        }
+    }
+    Some(shielded || nullifiers)
+}
+
+fn put_message(out: &mut Vec<u8>, number: u32, message: &[u8]) {
+    prost::encoding::encode_key(number, prost::encoding::WireType::LengthDelimited, out);
+    prost::encoding::encode_varint(message.len() as u64, out);
+    out.extend_from_slice(message);
+}
+
+/// One varint or length-delimited protobuf field.
+struct Field<'a> {
+    number: u32,
+    /// The field including its key, for copying verbatim.
+    raw: &'a [u8],
+    /// A length-delimited field's contents.
+    value: Option<&'a [u8]>,
+}
+
+/// Iterates fields, yielding `None` on malformed input or other wire types.
+struct Fields<'a>(&'a [u8]);
+
+impl<'a> Iterator for Fields<'a> {
+    type Item = Option<Field<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let start = self.0;
+        let field = (|| {
+            let (number, wire_type) = prost::encoding::decode_key(&mut self.0).ok()?;
+            let value = match wire_type {
+                prost::encoding::WireType::Varint => {
+                    prost::encoding::decode_varint(&mut self.0).ok()?;
+                    None
+                }
+                prost::encoding::WireType::LengthDelimited => {
+                    let len = usize::try_from(prost::encoding::decode_varint(&mut self.0).ok()?)
+                        .ok()
+                        .filter(|len| *len <= self.0.len())?;
+                    let (value, rest) = self.0.split_at(len);
+                    self.0 = rest;
+                    Some(value)
+                }
+                _ => return None,
+            };
+            Some(Field {
+                number,
+                raw: &start[..start.len() - self.0.len()],
+                value,
+            })
+        })();
+        if field.is_none() {
+            // Stop after malformed input.
+            self.0 = &[];
+        }
+        Some(field)
+    }
+}
+
 pub(crate) fn add_transparent_txs(
     block: &mut proto::CompactBlock,
     transactions: &[std::sync::Arc<transaction::Transaction>],
@@ -327,6 +486,271 @@ mod tests {
             parse_block,
         },
     };
+
+    #[test]
+    fn encoded_projection_is_byte_identical_to_decoding() {
+        use prost::Message as _;
+
+        let mut records: Vec<CompactBlockRecord> =
+            [&*BLOCK_MAINNET_949496_BYTES, &*BLOCK_TESTNET_1842421_BYTES]
+                .into_iter()
+                .map(|bytes| {
+                    let block = Block::zcash_deserialize(bytes.as_slice()).unwrap();
+                    let parsed = parse_block(&RawIndexBlock {
+                        height: block.coinbase_height().unwrap(),
+                        hash: block.hash(),
+                        bytes: bytes.to_vec(),
+                        txids: block.transactions.iter().map(|tx| tx.hash()).collect(),
+                    })
+                    .unwrap();
+                    CompactBlockRecord {
+                        height: parsed.height,
+                        hash: parsed.hash,
+                        previous_hash: parsed.previous_hash,
+                        time: parsed.time,
+                        transactions: parsed.transactions,
+                        end_tree_sizes: TreeSizes {
+                            sapling: 5,
+                            orchard: 0,
+                            ironwood: 300,
+                        },
+                    }
+                })
+                .collect();
+        let shielded = |index: u64, spends, outputs, orchard, ironwood| CompactTransaction {
+            index,
+            txid: [index as u8; 32],
+            sapling_spends: vec![[1; 32]; spends],
+            sapling_outputs: vec![
+                CompactSaplingOutput {
+                    cmu: [2; 32],
+                    ephemeral_key: [3; 32],
+                    ciphertext: [4; 52],
+                };
+                outputs
+            ],
+            orchard_actions: (0..orchard).map(|n| action(n as u8)).collect(),
+            ironwood_actions: (0..ironwood).map(|n| action(!n as u8)).collect(),
+        };
+        records.push(CompactBlockRecord {
+            height: 0,
+            hash: [5; 32],
+            previous_hash: [6; 32],
+            time: 0,
+            transactions: vec![
+                shielded(0, 1, 0, 0, 0),
+                shielded(1, 0, 2, 0, 0),
+                shielded(2, 0, 0, 3, 0),
+                shielded(3, 0, 0, 0, 4),
+                shielded(300, 2, 2, 2, 2),
+            ],
+            end_tree_sizes: TreeSizes::default(),
+        });
+
+        let pool_sets: [&[proto::PoolType]; 8] = [
+            &[],
+            &[proto::PoolType::Sapling],
+            &[proto::PoolType::Orchard],
+            &[proto::PoolType::Ironwood],
+            &[proto::PoolType::Sapling, proto::PoolType::Orchard],
+            &[proto::PoolType::Orchard, proto::PoolType::Ironwood],
+            &[proto::PoolType::Sapling, proto::PoolType::Ironwood],
+            &[
+                proto::PoolType::Ironwood,
+                proto::PoolType::Sapling,
+                proto::PoolType::Orchard,
+            ],
+        ];
+        for record in &records {
+            let encoded = record.to_proto().encode_to_vec();
+            for pools in pool_sets {
+                let pools = pools.iter().map(|pool| *pool as i32).collect::<Vec<_>>();
+                let pools = PoolSelection::from_request(&pools).unwrap();
+                for nullifiers in [false, true] {
+                    let expected = project_block(
+                        proto::CompactBlock::decode(encoded.as_slice()).unwrap(),
+                        pools,
+                        nullifiers,
+                    )
+                    .encode_to_vec();
+                    assert_eq!(
+                        project_encoded(&encoded, pools, nullifiers),
+                        Some(expected),
+                        "{pools:?} nullifiers={nullifiers}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Deterministic SplitMix64, so failures reproduce.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+
+        fn scalar(&mut self) -> u64 {
+            match self.below(3) {
+                0 => 0,
+                1 => self.below(300),
+                _ => self.next() >> self.below(64),
+            }
+        }
+
+        /// Any length, including empty, so nothing depends on the index's fixed widths.
+        fn bytes(&mut self) -> Vec<u8> {
+            let len = match self.below(4) {
+                0 => 0,
+                1 => 32,
+                _ => self.below(200),
+            };
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+
+        fn count(&mut self) -> usize {
+            self.below(4) as usize
+        }
+    }
+
+    #[test]
+    fn encoded_projection_matches_decoding_on_random_blocks() {
+        use prost::Message as _;
+
+        let mut rng = Rng(20_261_016);
+        let pool_types = [
+            proto::PoolType::Sapling,
+            proto::PoolType::Orchard,
+            proto::PoolType::Ironwood,
+        ];
+        for _ in 0..3_000 {
+            let action = |rng: &mut Rng| proto::CompactOrchardAction {
+                nullifier: rng.bytes(),
+                cmx: rng.bytes(),
+                ephemeral_key: rng.bytes(),
+                ciphertext: rng.bytes(),
+            };
+            let vtx = (0..rng.below(5))
+                .map(|_| proto::CompactTx {
+                    index: rng.scalar(),
+                    txid: rng.bytes(),
+                    fee: rng.scalar() as u32,
+                    spends: (0..rng.count())
+                        .map(|_| proto::CompactSaplingSpend { nf: rng.bytes() })
+                        .collect(),
+                    outputs: (0..rng.count())
+                        .map(|_| proto::CompactSaplingOutput {
+                            cmu: rng.bytes(),
+                            ephemeral_key: rng.bytes(),
+                            ciphertext: rng.bytes(),
+                        })
+                        .collect(),
+                    actions: (0..rng.count()).map(|_| action(&mut rng)).collect(),
+                    ironwood_actions: (0..rng.count()).map(|_| action(&mut rng)).collect(),
+                    // The compact index never stores transparent data.
+                    vin: Vec::new(),
+                    vout: Vec::new(),
+                })
+                .collect();
+            let block = proto::CompactBlock {
+                height: rng.scalar(),
+                hash: rng.bytes(),
+                prev_hash: rng.bytes(),
+                time: rng.scalar() as u32,
+                header: if rng.below(4) == 0 {
+                    rng.bytes()
+                } else {
+                    Vec::new()
+                },
+                vtx,
+                chain_metadata: match rng.below(3) {
+                    0 => None,
+                    1 => Some(proto::ChainMetadata::default()),
+                    _ => Some(proto::ChainMetadata {
+                        sapling_commitment_tree_size: rng.scalar() as u32,
+                        orchard_commitment_tree_size: rng.scalar() as u32,
+                        ironwood_commitment_tree_size: rng.scalar() as u32,
+                    }),
+                },
+            };
+            let encoded = block.encode_to_vec();
+            for mask in 0..8u8 {
+                let pools = pool_types
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| mask & (1 << bit) != 0)
+                    .map(|(_, pool)| *pool as i32)
+                    .collect::<Vec<_>>();
+                let pools = PoolSelection::from_request(&pools).unwrap();
+                for nullifiers in [false, true] {
+                    let expected = project_block(block.clone(), pools, nullifiers).encode_to_vec();
+                    assert_eq!(
+                        project_encoded(&encoded, pools, nullifiers),
+                        Some(expected),
+                        "{block:?} {pools:?} nullifiers={nullifiers}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_projection_declines_non_canonical_input() {
+        use prost::Message as _;
+
+        let pools = PoolSelection::from_request(&[]).unwrap();
+        let block = proto::CompactBlock {
+            height: 1,
+            hash: vec![1; 32],
+            vtx: vec![proto::CompactTx {
+                index: 1,
+                txid: vec![2; 32],
+                actions: vec![proto::CompactOrchardAction {
+                    nullifier: vec![3; 32],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            chain_metadata: Some(proto::ChainMetadata::default()),
+            ..Default::default()
+        };
+        let encoded = block.encode_to_vec();
+        assert!(project_encoded(&encoded, pools, true).is_some());
+
+        let with_vin = proto::CompactBlock {
+            vtx: vec![proto::CompactTx {
+                vin: vec![proto::CompactTxIn::default()],
+                ..block.vtx[0].clone()
+            }],
+            ..block.clone()
+        };
+        // Height (field 2, two bytes) moved after chain metadata.
+        let reordered = [&encoded[2..], &encoded[..2]].concat();
+        let mut unknown = encoded.clone();
+        unknown.extend_from_slice(&[0x48, 1]);
+        let mut wrong_type = encoded.clone();
+        wrong_type[0] = 0x12;
+        for input in [
+            with_vin.encode_to_vec(),
+            reordered,
+            unknown,
+            wrong_type,
+            encoded[..encoded.len() - 1].to_vec(),
+        ] {
+            for nullifiers in [false, true] {
+                assert_eq!(project_encoded(&input, pools, nullifiers), None);
+            }
+        }
+    }
 
     #[test]
     fn validates_pools_and_projects_full_and_nullifier_blocks() {

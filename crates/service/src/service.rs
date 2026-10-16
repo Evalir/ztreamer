@@ -26,10 +26,11 @@ use crate::telemetry::{ObservedSource, ServiceMetrics};
 
 use crate::serve::{
     PoolSelection, add_transparent_txs, compact_mempool_txs, excluded_txids, project_block,
+    project_encoded,
 };
 use ztreamer_indexer::{
     Digest,
-    codec::{CompactBlockRecord, EncodedBlockRecord, ProtobufBlockRecord, StoredBlock},
+    codec::{CodecError, CompactBlockRecord, EncodedBlockRecord, ProtobufBlockRecord, StoredBlock},
     head::{CanonicalBlockSource, HeadSyncError, recover_deep_reorg},
     index::{BlockId, Index, IndexError, IndexState},
     pipeline::PipelineConfig,
@@ -427,10 +428,12 @@ impl CompactService {
         request: proto::BlockId,
         nullifiers: bool,
     ) -> Result<EncodedCompactBlock, Status> {
+        let block = self.record_as::<EncodedBlockRecord>(request).await?.block;
         if nullifiers {
-            return self.block(request, true).await.map(Into::into);
+            let pools = PoolSelection::from_request(&[]).expect("empty pool selection is valid");
+            return project_encoded_block(block, pools, true);
         }
-        Ok(self.record_as::<EncodedBlockRecord>(request).await?.block)
+        Ok(block)
     }
 
     pub(crate) async fn encoded_range(
@@ -1187,6 +1190,24 @@ fn mempool_compact(
         })
         .collect::<Result<Vec<_>, Status>>()?;
     compact_mempool_txs(&transactions, pools, &[])
+}
+
+/// Projects without decoding when the block is in the index's canonical layout.
+fn project_encoded_block(
+    block: EncodedCompactBlock,
+    pools: PoolSelection,
+    nullifiers: bool,
+) -> Result<EncodedCompactBlock, Status> {
+    if let Some(projected) = block
+        .as_encoded()
+        .and_then(|bytes| project_encoded(bytes, pools, nullifiers))
+    {
+        return Ok(EncodedCompactBlock::from_encoded(projected.into()));
+    }
+    let block = block
+        .into_decoded()
+        .map_err(|_| index_status(IndexError::Codec(CodecError::InvalidRecord)))?;
+    Ok(project_block(block, pools, nullifiers).into())
 }
 
 fn range_heights(request: &proto::BlockRange) -> Result<(u32, u32), Status> {

@@ -24,6 +24,14 @@ impl EncodedCompactBlock {
         Self(Repr::Encoded(bytes))
     }
 
+    /// The encoded payload, unless this block was built from a decoded message.
+    pub fn as_encoded(&self) -> Option<&Bytes> {
+        match &self.0 {
+            Repr::Encoded(bytes) => Some(bytes),
+            Repr::Decoded(_) => None,
+        }
+    }
+
     pub fn into_decoded(self) -> Result<proto::CompactBlock, DecodeError> {
         match self.0 {
             Repr::Encoded(bytes) => proto::CompactBlock::decode(bytes),
