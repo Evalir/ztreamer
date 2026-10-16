@@ -75,9 +75,16 @@ fn grpc(c: &mut Criterion) {
     let mut group = c.benchmark_group("grpc_raw_projected_mixed_v1");
     let mut orchard = range(0, 1_999);
     orchard.pool_types = vec![proto::PoolType::Orchard as i32];
+    // The fixture has no Ironwood data, so this filter removes nothing.
+    let mut sapling_orchard = range(0, 1_999);
+    sapling_orchard.pool_types = vec![
+        proto::PoolType::Sapling as i32,
+        proto::PoolType::Orchard as i32,
+    ];
     for (name, method, request) in [
         ("nullifiers", GET_BLOCK_RANGE_NULLIFIERS, range(0, 1_999)),
         ("orchard-only", GET_BLOCK_RANGE, orchard),
+        ("sapling-orchard", GET_BLOCK_RANGE, sapling_orchard),
     ] {
         for concurrency in [1, 8] {
             group.throughput(Throughput::Elements(2_000 * concurrency as u64));
