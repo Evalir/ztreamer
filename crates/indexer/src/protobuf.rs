@@ -303,6 +303,99 @@ mod tests {
         }
     }
 
+    /// Deterministic SplitMix64, so failures reproduce.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+
+        /// Covers every varint length class, zero, and the boundaries between them.
+        fn scalar(&mut self, bits: u32) -> u64 {
+            let value = match self.below(4) {
+                0 => 0,
+                1 => 1u64.checked_shl(7 * self.below(10) as u32).unwrap_or(0),
+                2 => (1u64.checked_shl(7 * self.below(10) as u32).unwrap_or(0)).wrapping_sub(1),
+                _ => self.next() >> self.below(64),
+            };
+            if bits == 64 {
+                value
+            } else {
+                value & ((1 << bits) - 1)
+            }
+        }
+
+        fn bytes<const N: usize>(&mut self) -> [u8; N] {
+            std::array::from_fn(|_| self.next() as u8)
+        }
+
+        fn count(&mut self) -> usize {
+            // Mostly small, sometimes large enough for multi-byte transaction lengths.
+            match self.below(8) {
+                0 => self.below(200) as usize,
+                _ => self.below(4) as usize,
+            }
+        }
+    }
+
+    #[test]
+    fn direct_encoding_matches_prost_on_random_records() {
+        let mut rng = Rng(20_261_016);
+        for _ in 0..5_000 {
+            let transactions = (0..rng.below(6))
+                .map(|_| CompactTransaction {
+                    index: rng.scalar(64),
+                    txid: rng.bytes(),
+                    sapling_spends: (0..rng.count()).map(|_| rng.bytes()).collect(),
+                    sapling_outputs: (0..rng.count())
+                        .map(|_| CompactSaplingOutput {
+                            cmu: rng.bytes(),
+                            ephemeral_key: rng.bytes(),
+                            ciphertext: rng.bytes(),
+                        })
+                        .collect(),
+                    orchard_actions: (0..rng.count())
+                        .map(|_| CompactShieldedAction {
+                            nullifier: rng.bytes(),
+                            commitment: rng.bytes(),
+                            ephemeral_key: rng.bytes(),
+                            ciphertext: rng.bytes(),
+                        })
+                        .collect(),
+                    ironwood_actions: (0..rng.count())
+                        .map(|_| CompactShieldedAction {
+                            nullifier: rng.bytes(),
+                            commitment: rng.bytes(),
+                            ephemeral_key: rng.bytes(),
+                            ciphertext: rng.bytes(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            assert_matches_prost(&CompactBlockRecord {
+                height: rng.scalar(32) as u32,
+                hash: rng.bytes(),
+                previous_hash: rng.bytes(),
+                time: rng.scalar(32) as u32,
+                transactions,
+                end_tree_sizes: TreeSizes {
+                    sapling: rng.scalar(32) as u32,
+                    orchard: rng.scalar(32) as u32,
+                    ironwood: rng.scalar(32) as u32,
+                },
+            });
+        }
+    }
+
     #[test]
     fn direct_encoding_is_byte_identical_to_prost_at_varint_boundaries() {
         let scalars = [0, 1, 127, 128, 16_383, 16_384, u32::MAX];
