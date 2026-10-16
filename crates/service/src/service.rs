@@ -69,8 +69,13 @@ impl From<IndexState> for ServingSnapshot {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("volatile head does not connect to the durable index")]
-pub struct SnapshotError;
+pub enum SnapshotError {
+    #[error("volatile head does not connect to the durable index")]
+    Disconnected,
+    /// The index stores only transactions with shielded data; neither may the head.
+    #[error("volatile block {height} has a transaction without shielded data")]
+    Payload { height: u32 },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Readiness {
@@ -116,9 +121,16 @@ impl ServingSnapshot {
             if block.height != expected_height
                 || previous_hash.is_some_and(|hash| block.previous_hash != hash)
             {
-                return Err(SnapshotError);
+                return Err(SnapshotError::Disconnected);
             }
-            expected_height = expected_height.checked_add(1).ok_or(SnapshotError)?;
+            if !block.transactions.iter().all(|tx| tx.has_payload()) {
+                return Err(SnapshotError::Payload {
+                    height: block.height,
+                });
+            }
+            expected_height = expected_height
+                .checked_add(1)
+                .ok_or(SnapshotError::Disconnected)?;
             previous_hash = Some(block.hash);
         }
         let visible_tip = volatile_head
@@ -1621,6 +1633,27 @@ mod tests {
                 assert_eq!(root.completing_block_hash, hash(1_007));
                 assert_eq!(root.completing_block_height, 1_007);
             });
+    }
+
+    #[test]
+    fn volatile_heads_reject_transactions_without_shielded_data() {
+        let mut block = record(1);
+        block.height = 0;
+        assert!(ServingSnapshot::with_head(IndexState::default(), vec![block.clone()]).is_ok());
+        block
+            .transactions
+            .push(ztreamer_indexer::parser::CompactTransaction {
+                index: 0,
+                txid: [1; 32],
+                sapling_spends: Vec::new(),
+                sapling_outputs: Vec::new(),
+                orchard_actions: Vec::new(),
+                ironwood_actions: Vec::new(),
+            });
+        assert!(matches!(
+            ServingSnapshot::with_head(IndexState::default(), vec![block]),
+            Err(SnapshotError::Payload { height: 0 })
+        ));
     }
 
     #[test]

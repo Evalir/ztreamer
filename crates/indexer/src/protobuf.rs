@@ -33,7 +33,6 @@ impl CompactBlockRecord {
             + self
                 .transactions
                 .iter()
-                .filter(|tx| tx.has_payload())
                 .map(|tx| nested_len(transaction_len(tx)))
                 .sum::<usize>()
             + nested_len(metadata)
@@ -46,8 +45,7 @@ impl CompactBlockRecord {
         put_bytes(buf, 3, &self.hash);
         put_bytes(buf, 4, &self.previous_hash);
         put_uint(buf, 5, u64::from(self.time));
-        // Like the index, responses never carry transactions without shielded data.
-        for tx in self.transactions.iter().filter(|tx| tx.has_payload()) {
+        for tx in &self.transactions {
             put_key(buf, 7, LENGTH_DELIMITED, transaction_len(tx));
             put_uint(buf, 1, tx.index);
             put_bytes(buf, 2, &tx.txid);
@@ -249,14 +247,7 @@ mod tests {
     use crate::parser::{RawIndexBlock, parse_block};
 
     fn assert_matches_prost(record: &CompactBlockRecord) {
-        let mut expected = record.to_proto();
-        expected.vtx.retain(|tx| {
-            !tx.spends.is_empty()
-                || !tx.outputs.is_empty()
-                || !tx.actions.is_empty()
-                || !tx.ironwood_actions.is_empty()
-        });
-        let expected = expected.encode_to_vec();
+        let expected = record.to_proto().encode_to_vec();
         let mut actual = Vec::new();
         record.encode_proto(&mut actual);
         assert_eq!(actual, expected);
@@ -399,7 +390,9 @@ mod tests {
     #[test]
     fn direct_encoding_is_byte_identical_to_prost_at_varint_boundaries() {
         let scalars = [0, 1, 127, 128, 16_383, 16_384, u32::MAX];
-        // Counts that push transaction and block lengths across 1-, 2- and 3-byte varints.
+        // Transaction lengths in each varint class: 1 byte for the payload-less
+        // transaction, 2 bytes for counts 1-3 and 3 bytes for the rest. The random
+        // test covers lengths near the class boundaries.
         for count in [0, 1, 2, 3, 104, 105, 106, 1_000] {
             for (i, &scalar) in scalars.iter().enumerate() {
                 let tx = CompactTransaction {

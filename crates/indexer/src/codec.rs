@@ -75,6 +75,8 @@ impl StoredBlock for EncodedBlockRecord {
         })
     }
 
+    /// Index records, durable or volatile, never hold transactions without shielded data,
+    /// so this matches the encoding the index stores.
     fn from_record(record: &CompactBlockRecord) -> Self {
         let mut bytes = Vec::with_capacity(record.proto_len());
         record.encode_proto(&mut bytes);
@@ -161,12 +163,7 @@ impl CompactBlockRecord {
 
     fn encode_into(&self, bytes: &mut Vec<u8>) -> Result<(), CodecError> {
         // Compact index transactions must contain shielded data, as emitted by the parser.
-        if self.transactions.iter().any(|tx| {
-            tx.sapling_spends.is_empty()
-                && tx.sapling_outputs.is_empty()
-                && tx.orchard_actions.is_empty()
-                && tx.ironwood_actions.is_empty()
-        }) {
+        if self.transactions.iter().any(|tx| !tx.has_payload()) {
             return Err(CodecError::InvalidRecord);
         }
         let len = self.proto_len();

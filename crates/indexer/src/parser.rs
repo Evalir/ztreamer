@@ -61,7 +61,8 @@ pub struct CompactTransaction {
 }
 
 impl CompactTransaction {
-    pub(crate) fn has_payload(&self) -> bool {
+    /// Index records hold only transactions with shielded data.
+    pub fn has_payload(&self) -> bool {
         !self.sapling_spends.is_empty()
             || !self.sapling_outputs.is_empty()
             || !self.orchard_actions.is_empty()
