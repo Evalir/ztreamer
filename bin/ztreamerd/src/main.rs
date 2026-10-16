@@ -58,7 +58,10 @@ struct Cli {
     #[arg(long)]
     max_pending_bytes: Option<NonZeroUsize>,
 
-    /// Maximum compact-index write batch size in bytes.
+    /// Maximum compact-index write batch size in bytes. It also limits how far the historical
+    /// fetch workers read ahead: they can have at most `--max-pending-bytes` minus the larger of
+    /// this value and 2 MB (the largest block record) in flight, plus the one block that the
+    /// index needs next.
     #[arg(long)]
     max_batch_bytes: Option<NonZeroUsize>,
 

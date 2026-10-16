@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     Digest,
-    codec::{CodecError, CompactBlockRecord, TreeSizes},
+    codec::{CodecError, CompactBlockRecord, MAX_RECORD_BYTES, TreeSizes},
     index::{IndexState, RANGE_SIZE},
     parser::ParsedCompactBlock,
 };
@@ -64,6 +64,23 @@ pub struct WriteBatch {
     /// the rest stored in `mutable_blocks`
     pub(crate) seal_through: Option<u32>,
     pub(crate) records: Vec<CompactBlockRecord>,
+}
+
+/// The pending bytes above which [`OrderedBuilder::build_batch`] writes a partial range.
+/// Below this value, it waits until all blocks of a range are ready, and then it seals the range.
+///
+/// The worker channel uses the same value as its byte limit, and the coordinator writes batches
+/// while `pending` is above it. So when the channel is at its limit, the builder writes the ready
+/// blocks, also a partial range, and the channel gets room again.
+///
+/// The value is `max_pending_bytes` minus the larger of one batch and one record of maximum
+/// size. The channel always lets the block at `first_missing_height` through. Because of this
+/// room, that block cannot make `pending` more than `max_pending_bytes`.
+pub(crate) fn partial_range_flush_threshold(
+    max_pending_bytes: usize,
+    max_batch_bytes: usize,
+) -> usize {
+    max_pending_bytes.saturating_sub(max_batch_bytes.max(MAX_RECORD_BYTES))
 }
 
 impl OrderedBuilder {
@@ -146,7 +163,8 @@ impl OrderedBuilder {
             .ok_or(IngestError::Overflow)?;
         if seal_through.is_some_and(|height| range_end <= height)
             && self.ready_end <= u64::from(range_end)
-            && self.pending_bytes <= self.max_pending_bytes.saturating_sub(max_batch_bytes)
+            && self.pending_bytes
+                <= partial_range_flush_threshold(self.max_pending_bytes, max_batch_bytes)
         {
             return Ok(None);
         }
@@ -312,7 +330,7 @@ mod tests {
     #[test]
     fn sealable_ranges_stay_in_one_batch() {
         let bytes = CompactBlockRecord::encoded_size_bound(&[]).unwrap();
-        let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
+        let mut builder = OrderedBuilder::new(IndexState::default(), 10_000_000).unwrap();
         for height in 0..RANGE_SIZE / 2 {
             builder.push(prepared(height)).unwrap();
         }

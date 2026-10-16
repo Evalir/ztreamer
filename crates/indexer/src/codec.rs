@@ -8,7 +8,7 @@ use crate::{Digest, index::RANGE_SIZE, parser::CompactTransaction};
 
 const BLOCK_FORMAT_VERSION: u8 = 1;
 const RANGE_FORMAT_VERSION: u8 = 1;
-const MAX_RECORD_BYTES: usize = 2_000_000;
+pub(crate) const MAX_RECORD_BYTES: usize = 2_000_000;
 
 const PROTOBUF_ENVELOPE_BYTES: usize = 1 + 2 * size_of::<u32>() + 2 * size_of::<Digest>();
 
