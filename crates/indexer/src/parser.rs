@@ -61,7 +61,7 @@ pub struct CompactTransaction {
 }
 
 impl CompactTransaction {
-    fn has_payload(&self) -> bool {
+    pub(crate) fn has_payload(&self) -> bool {
         !self.sapling_spends.is_empty()
             || !self.sapling_outputs.is_empty()
             || !self.orchard_actions.is_empty()

@@ -76,18 +76,13 @@ impl StoredBlock for EncodedBlockRecord {
     }
 
     fn from_record(record: &CompactBlockRecord) -> Self {
-        let mut block = record.to_proto();
-        block.vtx.retain(|tx| {
-            !tx.spends.is_empty()
-                || !tx.outputs.is_empty()
-                || !tx.actions.is_empty()
-                || !tx.ironwood_actions.is_empty()
-        });
+        let mut bytes = Vec::with_capacity(record.proto_len());
+        record.encode_proto(&mut bytes);
         Self {
             height: record.height,
             hash: record.hash,
             previous_hash: record.previous_hash,
-            block: block.into(),
+            block: EncodedCompactBlock::from_encoded(bytes.into()),
         }
     }
 
@@ -174,8 +169,7 @@ impl CompactBlockRecord {
         }) {
             return Err(CodecError::InvalidRecord);
         }
-        let block = self.to_proto();
-        let len = block.encoded_len();
+        let len = self.proto_len();
         if len
             .checked_add(PROTOBUF_ENVELOPE_BYTES)
             .is_none_or(|len| len > MAX_RECORD_BYTES)
@@ -188,7 +182,8 @@ impl CompactBlockRecord {
         bytes.extend_from_slice(&self.hash);
         bytes.extend_from_slice(&self.previous_hash);
         put_u32(bytes, len as u32);
-        block.encode(bytes).map_err(|_| CodecError::Length)
+        self.encode_proto(bytes);
+        Ok(())
     }
 
     pub(crate) fn encoded_size_bound(
