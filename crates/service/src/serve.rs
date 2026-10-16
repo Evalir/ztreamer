@@ -124,28 +124,42 @@ pub(crate) fn project_encoded(
     pools: PoolSelection,
     nullifiers: bool,
 ) -> Option<Bytes> {
-    let (len, changed) = walk_block(block, envelope, pools, nullifiers, None)?;
+    // The first pass validates and sizes the output; the second writes it.
+    let mut tx_lens = Vec::new();
+    let (len, changed) = walk_block(block, envelope, pools, nullifiers, &mut tx_lens, None)?;
     if !changed {
         return Some(block.clone());
     }
     let mut out = Vec::with_capacity(len);
-    walk_block(block, envelope, pools, nullifiers, Some(&mut out))?;
+    walk_block(
+        block,
+        envelope,
+        pools,
+        nullifiers,
+        &mut tx_lens,
+        Some(&mut out),
+    )?;
     debug_assert_eq!(out.len(), len);
     Some(out.into())
 }
 
 const NULLIFIER_FIELD: usize = 2 + 32;
+/// Marks a transaction [`project_block`] drops in `walk_block`'s recorded lengths.
+const DROPPED: usize = usize::MAX;
 const CHAIN_METADATA_FIELD: u8 = 8 << 3 | 2;
 
 /// Validates `block` and returns the projected length and whether it differs from the
-/// input, writing the projection to `out` when given.
+/// input. Without `out`, it records each kept transaction's projected length in
+/// `tx_lens`; with `out`, it writes the projection using those lengths.
 fn walk_block(
     mut block: &[u8],
     envelope: Envelope<'_>,
     pools: PoolSelection,
     nullifiers: bool,
+    tx_lens: &mut Vec<usize>,
     mut out: Option<&mut Vec<u8>>,
 ) -> Option<(usize, bool)> {
+    let mut written_txs = 0;
     let (mut len, mut changed) = (0, nullifiers);
     let (mut height, mut hash, mut previous_hash, mut metadata) = (0, None, None, false);
     let mut previous = 0;
@@ -163,17 +177,31 @@ fn walk_block(
             (5, Value::Varint(value)) if value != 0 && value <= u64::from(u32::MAX) => {}
             (6, Value::Bytes(value)) if !value.is_empty() => {}
             (7, Value::Bytes(tx)) => {
-                let projected = project_tx(tx, pools, nullifiers, None)?;
-                changed |= projected.changed || !projected.keep;
-                if projected.keep {
-                    len += 1
-                        + prost::encoding::encoded_len_varint(projected.len as u64)
-                        + projected.len;
-                    if let Some(out) = out.as_deref_mut() {
-                        out.push(field.raw[0]);
-                        prost::encoding::encode_varint(projected.len as u64, out);
-                        project_tx(tx, pools, nullifiers, Some(out))?;
+                let tx_len = match out.as_deref_mut() {
+                    None => {
+                        let projected = project_tx(tx, pools, nullifiers)?;
+                        changed |= projected.changed || !projected.keep;
+                        let tx_len = if projected.keep {
+                            projected.len
+                        } else {
+                            DROPPED
+                        };
+                        tx_lens.push(tx_len);
+                        tx_len
                     }
+                    Some(out) => {
+                        let tx_len = *tx_lens.get(written_txs)?;
+                        written_txs += 1;
+                        if tx_len != DROPPED {
+                            out.push(field.raw[0]);
+                            prost::encoding::encode_varint(tx_len as u64, out);
+                            write_tx(tx, pools, nullifiers, out);
+                        }
+                        tx_len
+                    }
+                };
+                if tx_len != DROPPED {
+                    len += 1 + prost::encoding::encoded_len_varint(tx_len as u64) + tx_len;
                 }
                 continue;
             }
@@ -215,12 +243,8 @@ struct ProjectedTx {
     changed: bool,
 }
 
-fn project_tx(
-    mut tx: &[u8],
-    pools: PoolSelection,
-    nullifiers: bool,
-    mut out: Option<&mut Vec<u8>>,
-) -> Option<ProjectedTx> {
+/// Validates a transaction and measures its projection.
+fn project_tx(mut tx: &[u8], pools: PoolSelection, nullifiers: bool) -> Option<ProjectedTx> {
     let (mut len, mut shielded, mut changed) = (0, false, false);
     let mut previous = 0;
     while !tx.is_empty() {
@@ -250,19 +274,11 @@ fn project_tx(
             continue;
         }
         shielded |= field.number >= 4;
-        if let (true, 6 | 9, Value::Bytes(action)) = (nullifiers, field.number, field.value) {
-            // project_block keeps only the nullifier, the action's first field.
+        if nullifiers && matches!(field.number, 6 | 9) {
             changed = true;
             len += 2 + NULLIFIER_FIELD;
-            if let Some(out) = out.as_deref_mut() {
-                out.extend_from_slice(&[field.raw[0], NULLIFIER_FIELD as u8]);
-                out.extend_from_slice(&action[..NULLIFIER_FIELD]);
-            }
         } else {
             len += field.raw.len();
-            if let Some(out) = out.as_deref_mut() {
-                out.extend_from_slice(field.raw);
-            }
         }
     }
     Some(ProjectedTx {
@@ -270,6 +286,29 @@ fn project_tx(
         keep: shielded || nullifiers,
         changed,
     })
+}
+
+/// Writes the projection of a transaction [`project_tx`] has validated, so it only
+/// selects and copies fields.
+fn write_tx(mut tx: &[u8], pools: PoolSelection, nullifiers: bool, out: &mut Vec<u8>) {
+    while let Some(field) = next_field(&mut tx) {
+        let keep = match field.number {
+            4 => pools.sapling,
+            5 => pools.sapling && !nullifiers,
+            6 => pools.orchard,
+            9 => pools.ironwood,
+            _ => true,
+        };
+        match field.value {
+            Value::Bytes(action) if keep && nullifiers && matches!(field.number, 6 | 9) => {
+                // project_block keeps only the nullifier, the action's first field.
+                out.extend_from_slice(&[field.raw[0], NULLIFIER_FIELD as u8]);
+                out.extend_from_slice(&action[..NULLIFIER_FIELD]);
+            }
+            _ if keep => out.extend_from_slice(field.raw),
+            _ => {}
+        }
+    }
 }
 
 // The index's fixed layouts: every field present, 32 bytes except 52-byte ciphertexts.
@@ -357,10 +396,21 @@ fn next_field<'a>(reader: &mut &'a [u8]) -> Option<Field<'a>> {
     })
 }
 
+/// Reads a minimal LEB128 varint, the only form prost writes.
 fn canonical_varint(reader: &mut &[u8]) -> Option<u64> {
-    let before = reader.len();
-    let value = prost::encoding::decode_varint(reader).ok()?;
-    (before - reader.len() == prost::encoding::encoded_len_varint(value)).then_some(value)
+    let mut value = 0;
+    for (index, &byte) in reader.iter().enumerate().take(10) {
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte < 0x80 {
+            // A final zero byte pads a shorter encoding; a tenth byte above 1 overflows.
+            if (index > 0 && byte == 0) || (index == 9 && byte > 1) {
+                return None;
+            }
+            *reader = &reader[index + 1..];
+            return Some(value);
+        }
+    }
+    None
 }
 
 pub(crate) fn add_transparent_txs(
@@ -917,6 +967,40 @@ mod tests {
             answered > 5_000 && declined > 5_000,
             "{answered} {declined}"
         );
+    }
+
+    #[test]
+    fn canonical_varints_round_trip_and_reject_padding() {
+        let mut rng = Rng(3);
+        let values = (0..64)
+            .flat_map(|bit| [1u64 << bit, (1u64 << bit) - 1])
+            .chain([0, u64::MAX])
+            .chain((0..10_000).map(|_| rng.next() >> rng.below(64)));
+        for value in values {
+            let mut encoded = Vec::new();
+            prost::encoding::encode_varint(value, &mut encoded);
+            encoded.push(0xaa);
+            let mut reader = encoded.as_slice();
+            assert_eq!(canonical_varint(&mut reader), Some(value));
+            assert_eq!(reader, [0xaa]);
+
+            // The same value with a redundant trailing zero group.
+            let mut padded = encoded[..encoded.len() - 1].to_vec();
+            if padded.len() < 10 {
+                *padded.last_mut().unwrap() |= 0x80;
+                padded.push(0);
+                assert_eq!(canonical_varint(&mut padded.as_slice()), None, "{value}");
+            }
+        }
+        for overflowing in [
+            [0xff; 9].iter().copied().chain([2]).collect::<Vec<_>>(),
+            vec![0x80; 10],
+            vec![0x80; 11],
+            vec![0x80],
+            vec![],
+        ] {
+            assert_eq!(canonical_varint(&mut overflowing.as_slice()), None);
+        }
     }
 
     #[test]
