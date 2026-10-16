@@ -4,8 +4,12 @@ mod support;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::{sync::Arc, time::Duration};
-use support::{Client, LocalServer, RawClient, consume, consume_raw, range};
+use support::{
+    Client, GET_BLOCK_RANGE, GET_BLOCK_RANGE_NULLIFIERS, LocalServer, RawClient, consume,
+    consume_raw, range,
+};
 use tokio::{sync::Barrier, task::JoinSet};
+use ztreamer_protocol::proto;
 
 fn grpc(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -46,7 +50,12 @@ fn grpc(c: &mut Criterion) {
                             barrier.wait().await;
                             tokio::time::timeout(
                                 Duration::from_secs(30),
-                                consume_raw(&mut client, range(0, 1_999), Duration::ZERO),
+                                consume_raw(
+                                    &mut client,
+                                    GET_BLOCK_RANGE,
+                                    range(0, 1_999),
+                                    Duration::ZERO,
+                                ),
                             )
                             .await
                             .unwrap()
@@ -59,6 +68,40 @@ fn grpc(c: &mut Criterion) {
                 });
             },
         );
+    }
+    group.finish();
+
+    // Requests that project each stored block before sending it.
+    let mut group = c.benchmark_group("grpc_raw_projected_mixed_v1");
+    let mut orchard = range(0, 1_999);
+    orchard.pool_types = vec![proto::PoolType::Orchard as i32];
+    for (name, method, request) in [
+        ("nullifiers", GET_BLOCK_RANGE_NULLIFIERS, range(0, 1_999)),
+        ("orchard-only", GET_BLOCK_RANGE, orchard),
+    ] {
+        for concurrency in [1, 8] {
+            group.throughput(Throughput::Elements(2_000 * concurrency as u64));
+            group.bench_with_input(
+                BenchmarkId::new(name, concurrency),
+                &concurrency,
+                |b, &concurrency| {
+                    b.to_async(&runtime).iter(|| async {
+                        let mut tasks = JoinSet::new();
+                        for mut client in raw_clients[..concurrency].iter().cloned() {
+                            let request = request.clone();
+                            tasks.spawn(async move {
+                                consume_raw(&mut client, method, request, Duration::ZERO)
+                                    .await
+                                    .unwrap()
+                            });
+                        }
+                        while let Some(result) = tasks.join_next().await {
+                            std::hint::black_box(result.unwrap());
+                        }
+                    });
+                },
+            );
+        }
     }
     group.finish();
     drop(raw_clients);

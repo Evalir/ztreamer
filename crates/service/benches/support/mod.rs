@@ -156,6 +156,10 @@ impl LocalServer {
     }
 }
 
+pub const GET_BLOCK_RANGE: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange";
+pub const GET_BLOCK_RANGE_NULLIFIERS: &str =
+    "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRangeNullifiers";
+
 pub fn range(start: u32, end: u32) -> proto::BlockRange {
     let id = |height| {
         Some(proto::BlockId {
@@ -173,6 +177,7 @@ pub fn range(start: u32, end: u32) -> proto::BlockRange {
 /// Like [`consume`], but leaves blocks encoded so the measurement is dominated by the server.
 pub async fn consume_raw(
     client: &mut RawClient,
+    method: &'static str,
     range: proto::BlockRange,
     delay: Duration,
 ) -> Result<Observation, Error> {
@@ -181,9 +186,7 @@ pub async fn consume_raw(
     let expected = start.abs_diff(end) + 1;
     let started = Instant::now();
     client.0.ready().await?;
-    let path = tonic::codegen::http::uri::PathAndQuery::from_static(
-        "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
-    );
+    let path = tonic::codegen::http::uri::PathAndQuery::from_static(method);
     let mut stream = client
         .0
         .server_streaming(tonic::Request::new(range), path, RawCodec)
