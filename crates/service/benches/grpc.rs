@@ -86,13 +86,20 @@ fn grpc(c: &mut Criterion) {
                 &concurrency,
                 |b, &concurrency| {
                     b.to_async(&runtime).iter(|| async {
+                        let barrier = Arc::new(Barrier::new(concurrency));
                         let mut tasks = JoinSet::new();
                         for mut client in raw_clients[..concurrency].iter().cloned() {
+                            let barrier = barrier.clone();
                             let request = request.clone();
                             tasks.spawn(async move {
-                                consume_raw(&mut client, method, request, Duration::ZERO)
-                                    .await
-                                    .unwrap()
+                                barrier.wait().await;
+                                tokio::time::timeout(
+                                    Duration::from_secs(30),
+                                    consume_raw(&mut client, method, request, Duration::ZERO),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap()
                             });
                         }
                         while let Some(result) = tasks.join_next().await {
