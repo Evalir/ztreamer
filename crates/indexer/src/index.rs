@@ -12,7 +12,10 @@ use crate::codec::{
     CodecError, CompactBlockRecord, RangeDecoder, StoredBlock, TreeSizes, decode_range_record,
     encode_range_from_bytes,
 };
-use crate::{Digest, ingest::WriteBatch};
+use crate::{
+    Digest,
+    ingest::{EncodedBatch, WriteBatch},
+};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const RANGE_SIZE: u32 = 1_000;
@@ -446,14 +449,20 @@ impl Index {
 
     /// Atomically writes a batch and packs newly sealed ranges.
     pub fn write(&self, batch: WriteBatch) -> Result<IndexState, IndexError> {
+        self.write_encoded(batch.encode(1)?)
+    }
+
+    /// Atomically writes a batch with encoded records and packs newly sealed ranges.
+    pub(crate) fn write_encoded(&self, batch: EncodedBatch) -> Result<IndexState, IndexError> {
         let mut txn = self.env.write_txn()?;
         let mut state = read_state(self.metadata, &txn)?;
-        let WriteBatch {
+        let EncodedBatch {
             base_generation,
             seal_through,
-            records,
+            blocks,
+            end_tree_sizes,
         } = batch;
-        let first = records.first().expect("builders never emit empty batches");
+        let first = blocks.first().expect("builders never emit empty batches");
         let expected_height = match state.durable_tip {
             Some(tip) => tip.height.checked_add(1).ok_or(IndexError::Overflow)?,
             None => 0,
@@ -469,14 +478,13 @@ impl Index {
             });
         }
 
-        for record in &records {
+        for block in &blocks {
             self.hash_to_height
-                .put(&mut txn, record.hash.as_slice(), &record.height)?;
+                .put(&mut txn, block.hash.as_slice(), &block.height)?;
         }
-        let last = records.last().expect("the batch is non-empty");
+        let last = blocks.last().expect("the batch is non-empty");
         let tip = BlockId::new(last.height, last.hash);
-        let tree_sizes = last.end_tree_sizes;
-        let mut records = records.into_iter().peekable();
+        let mut blocks = blocks.into_iter().peekable();
         let mut start = state.sealed_through.map_or(Ok(0), |height| {
             height.checked_add(1).ok_or(IndexError::Overflow)
         })?;
@@ -490,14 +498,12 @@ impl Index {
             }
             // The head follower writes blocks to `mutable_blocks` before it seals them. Because of
             // this, the range can be complete in `mutable_blocks`, and the batch can start after it.
-            let first_new = records.peek().map_or(end + 1, |record| record.height);
+            let first_new = blocks.peek().map_or(end + 1, |block| block.height);
             let mutable_end = first_new.min(end + 1);
             let mut range = self.read_rows_to_seal(&txn, start..mutable_end, start)?;
             while range.len() < RANGE_SIZE as usize {
-                let record = records
-                    .next()
-                    .ok_or(IndexError::IncompleteRange { start })?;
-                range.push(record.encode()?);
+                let block = blocks.next().ok_or(IndexError::IncompleteRange { start })?;
+                range.push(block.bytes);
             }
             let parts: Vec<_> = range.iter().map(Vec::as_slice).collect();
             let packed = encode_range_from_bytes(&parts)?;
@@ -511,13 +517,12 @@ impl Index {
             state.sealed_through = Some(end);
             start = end.checked_add(1).ok_or(IndexError::Overflow)?;
         }
-        for record in records {
-            let encoded = record.encode()?;
+        for block in blocks {
             self.mutable_blocks
-                .put(&mut txn, &record.height, encoded.as_slice())?;
+                .put(&mut txn, &block.height, block.bytes.as_slice())?;
         }
         state.durable_tip = Some(tip);
-        state.tree_sizes = tree_sizes;
+        state.tree_sizes = end_tree_sizes;
         state.generation = state
             .generation
             .checked_add(1)
@@ -840,7 +845,7 @@ fn identity(network: &str, genesis_hash: Digest) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::{
-        codec::{ProtobufBlockRecord, decode_range_record, encode_range},
+        codec::{ProtobufBlockRecord, decode_range_record},
         ingest::OrderedBuilder,
         parser::ParsedCompactBlock,
     };
@@ -1080,7 +1085,7 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let encoded = encode_range(&records).unwrap();
+        let encoded = crate::codec::encode_range(&records).unwrap();
         index
             .sealed_ranges
             .put(&mut txn, &0, encoded.as_slice())

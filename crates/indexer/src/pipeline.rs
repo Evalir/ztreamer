@@ -24,7 +24,9 @@ use zakura_state::{TransactionLocation, ZakuraDb};
 
 use crate::{
     index::{Index, IndexError, IndexState},
-    ingest::{IngestError, OrderedBuilder, WriteBatch, partial_range_flush_threshold},
+    ingest::{
+        EncodedBatch, IngestError, OrderedBuilder, WriteBatch, partial_range_flush_threshold,
+    },
     parser::{CompactParseError, parse_stored_block},
 };
 
@@ -385,7 +387,7 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
                 ),
                 u64::from(start),
             );
-            let (batch_tx, batch_rx) = sync_channel::<WriteBatch>(1);
+            let (batch_tx, batch_rx) = sync_channel::<EncodedBatch>(1);
 
             // single threaded writer receives WriteBatches and writes to Index
             let writer = scope.spawn(move || self.write_batches(initial_state, batch_rx));
@@ -481,27 +483,23 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
     fn write_batches(
         &self,
         initial_state: IndexState,
-        batch_rx: Receiver<WriteBatch>,
+        batch_rx: Receiver<EncodedBatch>,
     ) -> Result<(IndexState, WriteStats), PipelineError> {
-        let mut result = Ok(initial_state);
+        let mut state = initial_state;
         let mut stats = WriteStats::default();
         while let Ok(batch) = batch_rx.recv() {
-            if let Ok(state) = &mut result {
-                stats.batches += 1;
-                stats.blocks += batch.records.len() as u64;
-                let started = Instant::now();
-                let blocks = batch.records.len() as u64;
-                let written = self.index.write(batch);
-                let elapsed = started.elapsed();
-                self.metrics.commit(elapsed, written.is_ok(), blocks);
-                match written {
-                    Ok(next) => *state = next,
-                    Err(error) => result = Err(error.into()),
-                }
-                stats.write += elapsed;
-            }
+            stats.batches += 1;
+            let blocks = batch.blocks.len() as u64;
+            stats.blocks += blocks;
+            let started = Instant::now();
+            let written = self.index.write_encoded(batch);
+            let elapsed = started.elapsed();
+            self.metrics.commit(elapsed, written.is_ok(), blocks);
+            stats.write += elapsed;
+            // Stop at the first error. The coordinator then stops when its next send fails.
+            state = written?;
         }
-        result.map(|state| (state, stats))
+        Ok((state, stats))
     }
 
     /// main parser worker job
@@ -561,7 +559,7 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
         initial_state: IndexState,
         target: u32,
         parsed_rx: ReadAheadReceiver,
-        batch_tx: SyncSender<WriteBatch>,
+        batch_tx: SyncSender<EncodedBatch>,
     ) -> Result<(Duration, Duration), PipelineError> {
         let mut builder = OrderedBuilder::new(initial_state, self.config.max_pending_bytes)?;
         // Write a batch when `max_batch_bytes` are ready. Also write batches while `pending` is
@@ -610,13 +608,8 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
                         break;
                     };
                     parsed_rx.release_bytes(pending - builder.pending_bytes());
-                    let started = Instant::now();
-                    let sent = batch_tx.send(batch);
-                    let elapsed = started.elapsed();
-                    self.metrics.batch_wait.record(elapsed.as_secs_f64());
-                    send_wait += elapsed;
+                    send_wait += self.send_batch(batch, &batch_tx)?;
                     self.metrics.buffer(&builder);
-                    sent.map_err(|_| PipelineError::Worker)?;
                     if builder.pending_bytes() <= read_ahead_limit {
                         break;
                     }
@@ -637,15 +630,30 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
         while let Some(batch) =
             builder.build_batch(drain_through, drain_through, self.config.max_batch_bytes)?
         {
-            let started = Instant::now();
-            let sent = batch_tx.send(batch);
-            let elapsed = started.elapsed();
-            self.metrics.batch_wait.record(elapsed.as_secs_f64());
-            send_wait += elapsed;
+            send_wait += self.send_batch(batch, &batch_tx)?;
             self.metrics.buffer(&builder);
-            sent.map_err(|_| PipelineError::Worker)?;
         }
         Ok((receive_wait, send_wait))
+    }
+
+    /// Encodes the batch on this thread, not on the writer thread. Then sends it to the writer.
+    /// Returns the time that the send waited.
+    fn send_batch(
+        &self,
+        batch: WriteBatch,
+        batch_tx: &SyncSender<EncodedBatch>,
+    ) -> Result<Duration, PipelineError> {
+        let started = Instant::now();
+        let batch = batch
+            .encode(self.config.workers)
+            .map_err(IngestError::from)?;
+        self.metrics.encode.record(started.elapsed().as_secs_f64());
+        let started = Instant::now();
+        let sent = batch_tx.send(batch);
+        let elapsed = started.elapsed();
+        self.metrics.batch_wait.record(elapsed.as_secs_f64());
+        sent.map_err(|_| PipelineError::Worker)?;
+        Ok(elapsed)
     }
 
     fn validate_config(&self) -> Result<(), PipelineError> {
