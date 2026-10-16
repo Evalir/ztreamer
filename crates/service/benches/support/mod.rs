@@ -29,29 +29,75 @@ impl RawClient {
         let channel = Channel::from_shared(endpoint)?.connect().await?;
         Ok(Self(tonic::client::Grpc::new(channel)))
     }
+
+    /// Every response frame of a block-range RPC, exactly as the server sent it.
+    pub async fn range_frames(
+        &mut self,
+        method: &'static str,
+        range: proto::BlockRange,
+    ) -> Result<Vec<prost::bytes::Bytes>, Error> {
+        self.0.ready().await?;
+        let path = tonic::codegen::http::uri::PathAndQuery::from_static(method);
+        let mut stream = self
+            .0
+            .server_streaming(tonic::Request::new(range), path, RawCodec::default())
+            .await?
+            .into_inner();
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.message().await? {
+            frames.push(frame);
+        }
+        Ok(frames)
+    }
+
+    /// A single-block RPC's response, exactly as the server sent it.
+    pub async fn block_frame(
+        &mut self,
+        method: &'static str,
+        block: proto::BlockId,
+    ) -> Result<prost::bytes::Bytes, Error> {
+        self.0.ready().await?;
+        let path = tonic::codegen::http::uri::PathAndQuery::from_static(method);
+        Ok(self
+            .0
+            .unary(tonic::Request::new(block), path, RawCodec::default())
+            .await?
+            .into_inner())
+    }
 }
 
 /// Encodes requests with Prost and passes response frames through undecoded.
-#[derive(Clone, Copy, Default)]
-struct RawCodec;
+struct RawCodec<T>(std::marker::PhantomData<fn(T)>);
 
-impl tonic::codec::Codec for RawCodec {
-    type Encode = proto::BlockRange;
-    type Decode = prost::bytes::Bytes;
-    type Encoder = RawCodec;
-    type Decoder = RawCodec;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        *self
-    }
-
-    fn decoder(&mut self) -> Self::Decoder {
-        *self
+impl<T> Default for RawCodec<T> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
     }
 }
 
-impl tonic::codec::Encoder for RawCodec {
-    type Item = proto::BlockRange;
+impl<T> Clone for RawCodec<T> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<T: prost::Message + Send + 'static> tonic::codec::Codec for RawCodec<T> {
+    type Encode = T;
+    type Decode = prost::bytes::Bytes;
+    type Encoder = RawCodec<T>;
+    type Decoder = RawCodec<T>;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        self.clone()
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        self.clone()
+    }
+}
+
+impl<T: prost::Message> tonic::codec::Encoder for RawCodec<T> {
+    type Item = T;
     type Error = tonic::Status;
 
     fn encode(
@@ -64,7 +110,7 @@ impl tonic::codec::Encoder for RawCodec {
     }
 }
 
-impl tonic::codec::Decoder for RawCodec {
+impl<T> tonic::codec::Decoder for RawCodec<T> {
     type Item = prost::bytes::Bytes;
     type Error = tonic::Status;
 
@@ -156,6 +202,9 @@ impl LocalServer {
     }
 }
 
+pub const GET_BLOCK: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlock";
+pub const GET_BLOCK_NULLIFIERS: &str =
+    "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockNullifiers";
 pub const GET_BLOCK_RANGE: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange";
 pub const GET_BLOCK_RANGE_NULLIFIERS: &str =
     "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRangeNullifiers";
@@ -189,7 +238,7 @@ pub async fn consume_raw(
     let path = tonic::codegen::http::uri::PathAndQuery::from_static(method);
     let mut stream = client
         .0
-        .server_streaming(tonic::Request::new(range), path, RawCodec)
+        .server_streaming(tonic::Request::new(range), path, RawCodec::default())
         .await?
         .into_inner();
     let mut first = None;

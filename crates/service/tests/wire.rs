@@ -15,6 +15,11 @@ async fn wire_server_preserves_blocks_filters_and_boundaries() {
     let mut client = support::Client::connect(server.endpoint.clone())
         .await
         .unwrap();
+    // Frames as sent, so projected responses are compared byte for byte rather than
+    // after a client decode that would normalize them.
+    let mut raw = support::RawClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
     for (start, end) in [
         (100, 199),
         (199, 100),
@@ -45,19 +50,28 @@ async fn wire_server_preserves_blocks_filters_and_boundaries() {
                     .range(request.clone(), nullifiers)
                     .await
                     .unwrap();
-                let mut actual = if nullifiers {
+                let method = if nullifiers {
+                    support::GET_BLOCK_RANGE_NULLIFIERS
+                } else {
+                    support::GET_BLOCK_RANGE
+                };
+                let mut actual = raw.range_frames(method, request.clone()).await.unwrap();
+                let mut decoded = if nullifiers {
                     client.get_block_range_nullifiers(request).await
                 } else {
                     client.get_block_range(request).await
                 }
                 .unwrap()
                 .into_inner();
+                actual.reverse();
                 while let Some(expected) = expected.next().await {
-                    let expected = expected.unwrap();
-                    let actual = actual.message().await.unwrap().expect("complete stream");
-                    assert_eq!(actual.encode_to_vec(), expected.encode_to_vec());
+                    let expected = expected.unwrap().encode_to_vec();
+                    assert_eq!(actual.pop().expect("complete stream"), expected);
+                    let decoded = decoded.message().await.unwrap().expect("complete stream");
+                    assert_eq!(decoded.encode_to_vec(), expected);
                 }
-                assert!(actual.message().await.unwrap().is_none());
+                assert!(actual.is_empty());
+                assert!(decoded.message().await.unwrap().is_none());
             }
         }
     }
@@ -91,11 +105,26 @@ async fn wire_server_preserves_blocks_filters_and_boundaries() {
                 .unwrap();
             assert_eq!(
                 client
-                    .get_block_nullifiers(request)
+                    .get_block_nullifiers(request.clone())
                     .await
                     .unwrap()
                     .into_inner(),
                 expected
+            );
+            assert_eq!(
+                raw.block_frame(support::GET_BLOCK_NULLIFIERS, request.clone())
+                    .await
+                    .unwrap(),
+                expected.encode_to_vec()
+            );
+            let expected = reference
+                .service
+                .block(request.clone(), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                raw.block_frame(support::GET_BLOCK, request).await.unwrap(),
+                expected.encode_to_vec()
             );
         }
     }
