@@ -22,6 +22,7 @@ pub(super) struct PipelineMetrics {
     pass: [Histogram; 4],
     pub receive_wait: Histogram,
     pub batch_wait: Histogram,
+    pub encode: Histogram,
 }
 
 impl PipelineMetrics {
@@ -49,6 +50,7 @@ impl PipelineMetrics {
             }),
             receive_wait: metrics::histogram!("ztreamer.pipeline.receive_wait.seconds"),
             batch_wait: metrics::histogram!("ztreamer.pipeline.batch_send_wait.seconds"),
+            encode: metrics::histogram!("ztreamer.pipeline.encode.seconds"),
         }
     }
 

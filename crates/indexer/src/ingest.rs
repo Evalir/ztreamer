@@ -66,6 +66,74 @@ pub struct WriteBatch {
     pub(crate) records: Vec<CompactBlockRecord>,
 }
 
+impl WriteBatch {
+    /// Encodes all records on a maximum of `threads` scoped threads. The result keeps the
+    /// encoded bytes and the identity of each block, but not the decoded transactions.
+    pub(crate) fn encode(self, threads: usize) -> Result<EncodedBatch, CodecError> {
+        let end_tree_sizes = self
+            .records
+            .last()
+            .expect("builders never emit empty batches")
+            .end_tree_sizes;
+        let encode = |records: &[CompactBlockRecord]| {
+            records
+                .iter()
+                .map(|record| {
+                    Ok(EncodedBlock {
+                        height: record.height,
+                        hash: record.hash,
+                        previous_hash: record.previous_hash,
+                        bytes: record.encode()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, CodecError>>()
+        };
+        let blocks = if threads <= 1 {
+            encode(&self.records)?
+        } else {
+            // A batch is never empty (see `end_tree_sizes` above), so `chunk` is at least 1.
+            let chunk = self.records.len().div_ceil(threads);
+            let chunks = std::thread::scope(|scope| {
+                let handles: Vec<_> = self
+                    .records
+                    .chunks(chunk)
+                    .map(|records| scope.spawn(move || encode(records)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("record encoding does not panic"))
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            chunks.into_iter().flatten().collect()
+        };
+        Ok(EncodedBatch {
+            base_generation: self.base_generation,
+            seal_through: self.seal_through,
+            blocks,
+            end_tree_sizes,
+        })
+    }
+}
+
+/// A [`WriteBatch`] with encoded records. It does not keep the decoded transactions, so it
+/// uses less memory while it waits for the writer.
+pub(crate) struct EncodedBatch {
+    pub(crate) base_generation: u64,
+    pub(crate) seal_through: Option<u32>,
+    pub(crate) blocks: Vec<EncodedBlock>,
+    /// The tree sizes at the end of the last block.
+    pub(crate) end_tree_sizes: TreeSizes,
+}
+
+/// One encoded block record, with the identity that the writer needs.
+pub(crate) struct EncodedBlock {
+    pub(crate) height: u32,
+    pub(crate) hash: Digest,
+    pub(crate) previous_hash: Digest,
+    /// The [`CompactBlockRecord::encode`] output.
+    pub(crate) bytes: Vec<u8>,
+}
+
 impl OrderedBuilder {
     pub fn new(state: IndexState, max_pending_bytes: usize) -> Result<Self, IngestError> {
         let next_height = match state.durable_tip {
@@ -331,6 +399,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(batch.records.len(), RANGE_SIZE as usize);
+    }
+
+    #[test]
+    fn parallel_encode_is_equal_to_record_encode() {
+        let mut builder = OrderedBuilder::new(IndexState::default(), 10_000_000).unwrap();
+        for height in 0..100 {
+            let mut block = prepared(height);
+            block.transactions.push(CompactTransaction {
+                index: 1,
+                txid: [height as u8; 32],
+                sapling_spends: vec![[2; 32]],
+                sapling_outputs: Vec::new(),
+                orchard_actions: Vec::new(),
+                ironwood_actions: Vec::new(),
+            });
+            builder.push(block).unwrap();
+        }
+        let batch = builder
+            .build_batch(Some(99), None, 10_000_000)
+            .unwrap()
+            .unwrap();
+        let expected: Vec<_> = batch
+            .records
+            .iter()
+            .map(|r| (r.height, r.hash, r.previous_hash, r.encode().unwrap()))
+            .collect();
+        let end_tree_sizes = batch.records.last().unwrap().end_tree_sizes;
+        for threads in [1, 7] {
+            let records = batch.records.clone();
+            let encoded = WriteBatch { records, ..batch }.encode(threads).unwrap();
+            let actual: Vec<_> = encoded
+                .blocks
+                .into_iter()
+                .map(|b| (b.height, b.hash, b.previous_hash, b.bytes))
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(encoded.end_tree_sizes, end_tree_sizes);
+        }
     }
 
     fn prepared(height: u32) -> ParsedCompactBlock {

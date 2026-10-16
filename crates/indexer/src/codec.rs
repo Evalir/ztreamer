@@ -164,8 +164,9 @@ impl CompactBlockRecord {
         Ok(bytes)
     }
 
-    fn encode_into(&self, bytes: &mut Vec<u8>) -> Result<(), CodecError> {
-        // Compact index transactions must contain shielded data, as emitted by the parser.
+    /// Checks the rules that a stored record must obey and that the protobuf decode does not
+    /// check: each compact transaction must contain shielded data, as emitted by the parser.
+    pub(crate) fn check(&self) -> Result<(), CodecError> {
         if self.transactions.iter().any(|tx| {
             tx.sapling_spends.is_empty()
                 && tx.sapling_outputs.is_empty()
@@ -174,6 +175,11 @@ impl CompactBlockRecord {
         }) {
             return Err(CodecError::InvalidRecord);
         }
+        Ok(())
+    }
+
+    fn encode_into(&self, bytes: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.check()?;
         let block = self.to_proto();
         let len = block.encoded_len();
         if len
@@ -243,14 +249,98 @@ fn protobuf_envelope(bytes: &[u8]) -> Result<(u32, Digest, Digest, &[u8]), Codec
 }
 
 pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecError> {
-    if records.len() != RANGE_SIZE as usize
-        || !records[0].height.is_multiple_of(RANGE_SIZE)
-        || records.windows(2).any(|pair| {
-            pair[0].height.checked_add(1) != Some(pair[1].height)
-                || pair[1].previous_hash != pair[0].hash
-        })
-    {
+    // Allocate only the fixed envelope. Do not read every record to calculate the size.
+    write_range(records, 0)
+}
+
+/// Puts encoded block records (as stored in `mutable_blocks`) into a range. It does not decode
+/// the records. It reads only the envelope of each record to check the height sequence.
+pub fn encode_range_from_bytes(parts: &[&[u8]]) -> Result<Vec<u8>, CodecError> {
+    let body_len = parts.iter().try_fold(0usize, |len, part| {
+        len.checked_add(size_of::<u32>() + part.len())
+            .ok_or(CodecError::Length)
+    })?;
+    write_range(parts, body_len)
+}
+
+/// A record that [`write_range`] can put into a range.
+trait RangeRecord {
+    /// The height, the hash, and the previous hash of the record.
+    fn id(&self) -> Result<(u32, Digest, Digest), CodecError>;
+    /// Writes the record encoding at the end of `bytes`.
+    fn write_to(&self, bytes: &mut Vec<u8>) -> Result<(), CodecError>;
+}
+
+impl RangeRecord for CompactBlockRecord {
+    fn id(&self) -> Result<(u32, Digest, Digest), CodecError> {
+        Ok((self.height, self.hash, self.previous_hash))
+    }
+
+    fn write_to(&self, bytes: &mut Vec<u8>) -> Result<(), CodecError> {
+        self.encode_into(bytes)
+    }
+}
+
+/// The bytes of a `mutable_blocks` row. They are already the record encoding.
+impl RangeRecord for &[u8] {
+    fn id(&self) -> Result<(u32, Digest, Digest), CodecError> {
+        protobuf_envelope(self)
+            .map(|(height, hash, previous_hash, _)| (height, hash, previous_hash))
+    }
+
+    fn write_to(&self, bytes: &mut Vec<u8>) -> Result<(), CodecError> {
+        bytes.extend_from_slice(self);
+        Ok(())
+    }
+}
+
+/// Checks that `records` are one aligned range with a correct hash chain. Then it writes the
+/// envelope, the offset table, and each record with its length, in one pass.
+///
+/// An aligned range holds exactly [`RANGE_SIZE`] blocks, and its first height is a multiple of
+/// [`RANGE_SIZE`]. With `RANGE_SIZE = 1000`, the range that starts at 2,000 holds heights
+/// 2,000 to 2,999 and no other heights. Each block must be the child of the block before it:
+///
+/// ```text
+/// records[0]    height 2000  previous_hash = P (the parent of the range, outside it)
+/// records[1]    height 2001  previous_hash = hash of records[0]
+/// ...
+/// records[999]  height 2999  previous_hash = hash of records[998], hash = H
+/// ```
+///
+/// The range then stores P and H in its envelope. A reader can check that two ranges connect
+/// without decoding a record. The checks below are in this order: the count, the start
+/// height, then for each next record the height + 1 and the link to the previous hash.
+///
+/// The output bytes (all integers are big-endian `u32`):
+///
+/// ```text
+/// version (u8) | first height | last height | P (32 bytes) | H (32 bytes)
+/// offsets: RANGE_SIZE + 1 values. Each is a position in the body, from the body start.
+///          offsets[i] is where record i starts. offsets[RANGE_SIZE] is the body length.
+/// body:    for each record: length | record bytes
+/// ```
+///
+/// The function writes an offset and a length before it knows them, so it writes zeros first
+/// and sets the values after it writes each record. `body_len` is only the capacity hint for
+/// the body. It can be zero.
+fn write_range<R: RangeRecord>(records: &[R], body_len: usize) -> Result<Vec<u8>, CodecError> {
+    if records.len() != RANGE_SIZE as usize {
         return Err(CodecError::InvalidRange);
+    }
+    let (first_height, mut last_hash, first_previous_hash) = records[0].id()?;
+    // The range must start at a range boundary: 0, 1000, 2000, ...
+    if !first_height.is_multiple_of(RANGE_SIZE) {
+        return Err(CodecError::InvalidRange);
+    }
+    let mut last_height = first_height;
+    // Each record must have the next height and point to the hash of the record before it.
+    for record in &records[1..] {
+        let (height, hash, previous_hash) = record.id()?;
+        if last_height.checked_add(1) != Some(height) || previous_hash != last_hash {
+            return Err(CodecError::InvalidRange);
+        }
+        (last_height, last_hash) = (height, hash);
     }
 
     // offset table size is (number of records + 1) * 4 bytes
@@ -259,20 +349,17 @@ pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecErro
         .checked_add(1)
         .and_then(|len| len.checked_mul(size_of::<u32>()))
         .ok_or(CodecError::Length)?;
-    // only preallocate the fixed envelope to avoid a second pass
     let capacity = 1usize
         .checked_add(2 * size_of::<u32>() + 2 * size_of::<Digest>())
         .and_then(|len| len.checked_add(offsets_len))
+        .and_then(|len| len.checked_add(body_len))
         .ok_or(CodecError::Length)?;
     let mut bytes = Vec::with_capacity(capacity);
     bytes.push(RANGE_FORMAT_VERSION);
-    put_u32(&mut bytes, records[0].height);
-    put_u32(
-        &mut bytes,
-        records.last().expect("range is non-empty").height,
-    );
-    bytes.extend_from_slice(&records[0].previous_hash);
-    bytes.extend_from_slice(&records.last().expect("range is non-empty").hash);
+    put_u32(&mut bytes, first_height);
+    put_u32(&mut bytes, last_height);
+    bytes.extend_from_slice(&first_previous_hash);
+    bytes.extend_from_slice(&last_hash);
     // reserve offset table
     let offsets_start = bytes.len();
     bytes.resize(offsets_start + offsets_len, 0);
@@ -285,7 +372,7 @@ pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecErro
         let length_offset = bytes.len();
         put_u32(&mut bytes, 0);
         let record_start = bytes.len();
-        record.encode_into(&mut bytes)?;
+        record.write_to(&mut bytes)?;
         // after serializing, backpatch the length field
         let record_len = bytes.len() - record_start;
         set_u32(&mut bytes, length_offset, record_len)?;
@@ -617,6 +704,31 @@ mod tests {
         assert_eq!(decode_range_record(&encoded, 0).unwrap(), records[0]);
         assert_eq!(decode_range_record(&encoded, 537).unwrap(), records[537]);
         assert_eq!(decode_range_record(&encoded, 999).unwrap(), records[999]);
+
+        // Stored record bytes give the same range.
+        let stored: Vec<_> = records.iter().map(|r| r.encode().unwrap()).collect();
+        let mut parts: Vec<_> = stored.iter().map(Vec::as_slice).collect();
+        assert_eq!(encode_range_from_bytes(&parts).unwrap(), encoded);
+
+        // Heights out of order.
+        parts.swap(3, 4);
+        assert_eq!(
+            encode_range_from_bytes(&parts),
+            Err(CodecError::InvalidRange)
+        );
+        records.swap(3, 4);
+        assert_eq!(encode_range(&records), Err(CodecError::InvalidRange));
+        records.swap(3, 4);
+
+        // Heights in order, but block 500 does not point to the hash of block 499.
+        records[500].previous_hash = [0xee; 32];
+        assert_eq!(encode_range(&records), Err(CodecError::InvalidRange));
+        let stored: Vec<_> = records.iter().map(|r| r.encode().unwrap()).collect();
+        let parts: Vec<_> = stored.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            encode_range_from_bytes(&parts),
+            Err(CodecError::InvalidRange)
+        );
     }
 
     fn action(byte: u8) -> CompactShieldedAction {
