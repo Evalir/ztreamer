@@ -1,8 +1,9 @@
 //! Allocation-count ratchet for codec and index read hot paths.
 //!
 //! Allocation counts are deterministic, unlike wall-clock benchmarks, so CI can hold
-//! the line on every pull request. A count above its ceiling fails; a count below it
-//! also fails, asking for the ceiling to be lowered so later regressions are caught.
+//! the line on every pull request. A count above its ceiling fails. A count below it
+//! only prints a note, so a toolchain whose std allocates less cannot fail unrelated
+//! changes; lower the ceiling with the improvement to keep the margin tight.
 
 #[path = "../../../benchmarks/fixtures.rs"]
 mod fixtures;
@@ -61,10 +62,9 @@ fn ratchet(name: &str, actual: u64, ceiling: u64) {
         actual <= ceiling,
         "{name}: {actual} allocations exceeds the ratchet ceiling of {ceiling}"
     );
-    assert!(
-        actual == ceiling,
-        "{name}: {actual} allocations is below the ceiling of {ceiling}; lower it to {actual}"
-    );
+    if actual < ceiling {
+        eprintln!("{name}: {actual} allocations is below the ceiling of {ceiling}; lower it");
+    }
 }
 
 #[test]
