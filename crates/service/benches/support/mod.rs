@@ -19,6 +19,72 @@ use ztreamer_service::CompactService;
 pub mod fixtures;
 
 pub type Client = CompactTxStreamerClient<Channel>;
+
+/// A wallet connection that keeps each `CompactBlock` as its received frame.
+#[derive(Clone)]
+pub struct RawClient(tonic::client::Grpc<Channel>);
+
+impl RawClient {
+    pub async fn connect(endpoint: String) -> Result<Self, Error> {
+        let channel = Channel::from_shared(endpoint)?.connect().await?;
+        Ok(Self(tonic::client::Grpc::new(channel)))
+    }
+}
+
+/// Encodes requests with Prost and passes response frames through undecoded.
+#[derive(Clone, Copy, Default)]
+struct RawCodec;
+
+impl tonic::codec::Codec for RawCodec {
+    type Encode = proto::BlockRange;
+    type Decode = prost::bytes::Bytes;
+    type Encoder = RawCodec;
+    type Decoder = RawCodec;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        *self
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        *self
+    }
+}
+
+impl tonic::codec::Encoder for RawCodec {
+    type Item = proto::BlockRange;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        item.encode(dst)
+            .map_err(|error| tonic::Status::internal(error.to_string()))
+    }
+}
+
+impl tonic::codec::Decoder for RawCodec {
+    type Item = prost::bytes::Bytes;
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        use prost::bytes::Buf as _;
+        Ok(Some(src.copy_to_bytes(src.remaining())))
+    }
+}
+
+/// `CompactBlock.height` is field 2 and is encoded first; proto3 omits height 0.
+fn raw_height(mut block: &[u8]) -> Result<u64, Error> {
+    if block.first() != Some(&0x10) {
+        return Ok(0);
+    }
+    block = &block[1..];
+    Ok(prost::encoding::decode_varint(&mut block)?)
+}
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct Fixture {
@@ -102,6 +168,56 @@ pub fn range(start: u32, end: u32) -> proto::BlockRange {
         end: id(end),
         pool_types: Vec::new(),
     }
+}
+
+/// Like [`consume`], but leaves blocks encoded so the measurement is dominated by the server.
+pub async fn consume_raw(
+    client: &mut RawClient,
+    range: proto::BlockRange,
+    delay: Duration,
+) -> Result<Observation, Error> {
+    let start = range.start.as_ref().unwrap().height;
+    let end = range.end.as_ref().unwrap().height;
+    let expected = start.abs_diff(end) + 1;
+    let started = Instant::now();
+    client.0.ready().await?;
+    let path = tonic::codegen::http::uri::PathAndQuery::from_static(
+        "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+    );
+    let mut stream = client
+        .0
+        .server_streaming(tonic::Request::new(range), path, RawCodec)
+        .await?
+        .into_inner();
+    let mut first = None;
+    let mut blocks = 0;
+    let mut bytes = 0;
+    while let Some(block) = stream.message().await? {
+        first.get_or_insert_with(|| started.elapsed());
+        let height = if start <= end {
+            start.checked_add(blocks)
+        } else {
+            start.checked_sub(blocks)
+        };
+        if blocks >= expected || Some(raw_height(&block)?) != height {
+            return Err("range returned an unexpected height".into());
+        }
+        blocks += 1;
+        bytes += block.len() as u64;
+        std::hint::black_box(block);
+        if !delay.is_zero() && blocks % 64 == 0 && blocks < expected {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    if blocks != expected {
+        return Err("range ended before all blocks arrived".into());
+    }
+    Ok(Observation {
+        first: first.unwrap(),
+        complete: started.elapsed(),
+        bytes,
+        blocks,
+    })
 }
 
 pub struct Observation {
