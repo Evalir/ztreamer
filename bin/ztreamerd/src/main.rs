@@ -4,7 +4,10 @@ use std::{
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -193,12 +196,27 @@ async fn run_application(
     let sync_index = Arc::clone(&index);
     info!("syncing historical compact index");
     let historical_started = Instant::now();
-    let mut historical = tokio::task::spawn_blocking(move || source.sync(&sync_index, pipeline));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut historical = tokio::task::spawn_blocking({
+        let stop = Arc::clone(&stop);
+        move || source.sync(&sync_index, pipeline, &stop)
+    });
     let state = tokio::select! {
         result = &mut historical => result.context("historical index task panicked")??,
         _ = shutdown.cancelled() => {
-            info!("waiting for the historical index writer before shutdown");
-            historical.await.context("historical index task panicked")??;
+            info!("stopping the historical index pass before shutdown");
+            stop.store(true, Ordering::Relaxed);
+            let state = historical.await.context("historical index task panicked")??;
+            info!(
+                height = state.durable_tip().map(|tip| tip.height),
+                elapsed_seconds = historical_started.elapsed().as_secs_f64(),
+                "historical compact index stopped before shutdown"
+            );
+            if cli.index_only {
+                return Err(anyhow!(
+                    "historical compact index stopped by shutdown before it completed"
+                ));
+            }
             return Ok(());
         }
     };

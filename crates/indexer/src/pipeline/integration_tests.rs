@@ -17,6 +17,9 @@ struct Fixture {
     omit: Option<u32>,
     reorder: bool,
     later_sent: (Mutex<bool>, Condvar),
+    /// Sets `stop` when the source sends this height.
+    stop_at: Option<u32>,
+    stop: std::sync::atomic::AtomicBool,
 }
 
 impl Fixture {
@@ -28,6 +31,8 @@ impl Fixture {
             omit: None,
             reorder: false,
             later_sent: (Mutex::new(false), Condvar::new()),
+            stop_at: None,
+            stop: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -80,6 +85,9 @@ impl HistoricalSource for Fixture {
             stats.bytes +=
                 CompactBlockRecord::encoded_size_bound(&block.transactions).unwrap() as u64;
             tx.send(block).map_err(|_| PipelineError::Worker)?;
+            if self.stop_at == Some(height) {
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if start > 0 {
                 let (lock, ready) = &self.later_sent;
                 *lock.lock().unwrap() = true;
@@ -234,6 +242,24 @@ fn historical_pass_seals_a_range_that_the_head_follower_left_in_mutable_rows() {
         .unwrap_or_else(|error| panic!("historical pass failed: {error}"));
     assert_eq!(state.sealed_through(), Some(999));
     verify(&index, source.count);
+}
+
+#[test]
+fn stop_ends_the_pass_early_with_a_valid_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let mut source = Fixture::new(20_000);
+    source.stop_at = Some(5_000);
+    let state = HistoricalPipeline::new(&index, &source, config(4))
+        .unwrap()
+        .with_stop(&source.stop)
+        .sync()
+        .unwrap();
+    // Each worker completes its segment. The segment of height 5,000 is 4,995 to 5,031, so the
+    // pass writes at least to 5,031, also the blocks of the incomplete range 5,000 to 5,999.
+    let count = state.durable_tip().map_or(0, |tip| tip.height + 1);
+    assert!((5_032..source.count).contains(&count), "{count}");
+    verify(&index, count);
 }
 
 #[test]
