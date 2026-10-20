@@ -19,7 +19,7 @@ pub(super) struct PipelineMetrics {
     stages: [Histogram; 5],
     segment: [Histogram; 2],
     commit: [Histogram; 2],
-    pass: [Histogram; 3],
+    pass: [Histogram; 4],
     pub receive_wait: Histogram,
     pub batch_wait: Histogram,
 }
@@ -44,7 +44,7 @@ impl PipelineMetrics {
             commit: ["success", "error"].map(|outcome| {
                 metrics::histogram!("ztreamer.pipeline.commit.seconds", "outcome" => outcome)
             }),
-            pass: ["success", "error", "panic"].map(|outcome| {
+            pass: ["success", "error", "panic", "stopped"].map(|outcome| {
                 metrics::histogram!("ztreamer.pipeline.pass.seconds", "outcome" => outcome)
             }),
             receive_wait: metrics::histogram!("ztreamer.pipeline.receive_wait.seconds"),
@@ -91,6 +91,11 @@ pub(super) struct PassMetrics<'a> {
 impl PassMetrics<'_> {
     pub fn finish(&mut self, success: bool) {
         self.outcome = usize::from(!success);
+    }
+
+    /// Records the pass as stopped early by its stop flag, not as complete.
+    pub fn stopped(&mut self) {
+        self.outcome = 3;
     }
 }
 

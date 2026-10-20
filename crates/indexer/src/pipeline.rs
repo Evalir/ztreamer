@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
     thread,
@@ -289,6 +289,8 @@ pub(crate) struct HistoricalPipeline<'a, S = ZakuraDb> {
     db: &'a S,
     config: PipelineConfig,
     metrics: PipelineMetrics,
+    /// When this flag is set, the pass stops early but completes normally (see [`Self::with_stop`]).
+    stop: Option<&'a AtomicBool>,
 }
 
 impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
@@ -302,9 +304,22 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
             db,
             config,
             metrics: PipelineMetrics::new(),
+            stop: None,
         };
         pipeline.validate_config()?;
         Ok(pipeline)
+    }
+
+    /// Lets `stop` end the pass early, for example at shutdown. When `stop` is set, each worker
+    /// completes its segment and starts no new segment. The writer writes the blocks that it
+    /// has, and the pass returns a state with a lower tip.
+    pub(crate) fn with_stop(mut self, stop: &'a AtomicBool) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
     }
 
     /// Ingests the finalized durable blocks available when this call starts.
@@ -312,6 +327,9 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
         let mut pass = self.metrics.pass();
         let result = self.sync_inner();
         pass.finish(result.is_ok());
+        if result.is_ok() && self.stopped() {
+            pass.stopped();
+        }
         result
     }
 
@@ -380,7 +398,8 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
                 worker_stats.add(worker.join().map_err(|_| PipelineError::Panic)??);
             }
             let (state, write_stats) = writer.join().map_err(|_| PipelineError::Panic)??;
-            if state.durable_tip().is_none_or(|tip| tip.height != target) {
+            // After a stop, the pass can end below the target.
+            if state.durable_tip().is_none_or(|tip| tip.height != target) && !self.stopped() {
                 return Err(PipelineError::SourceGap {
                     expected: state.durable_tip().map_or(start, |tip| tip.height + 1),
                     actual: None,
@@ -448,6 +467,9 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
         let _active = self.metrics.worker();
         let mut stats = WorkerStats::default();
         loop {
+            if self.stopped() {
+                return Ok(stats);
+            }
             let segment_start = next.fetch_add(
                 u64::from(self.config.source_segment_blocks),
                 Ordering::Relaxed,
@@ -506,8 +528,19 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
                 sent.map_err(|_| PipelineError::Worker)?;
             }
         }
+        // After a stop, the workers sent only part of the heights. Write every contiguous block
+        // that arrived: the last range is not complete, so its blocks go to mutable rows and the
+        // next pass does not fetch them again.
+        let drain_through = if self.stopped() {
+            u32::try_from(builder.first_missing_height())
+                .ok()
+                .and_then(|height| height.checked_sub(1))
+                .map(|height| height.min(target))
+        } else {
+            Some(target)
+        };
         while let Some(batch) =
-            builder.build_batch(Some(target), Some(target), self.config.max_batch_bytes)?
+            builder.build_batch(drain_through, drain_through, self.config.max_batch_bytes)?
         {
             let started = Instant::now();
             let sent = batch_tx.send(batch);
