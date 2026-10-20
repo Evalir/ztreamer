@@ -1,6 +1,9 @@
 //! Real coordinator/writer tests with a deterministic segment source.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use super::*;
 use crate::{
@@ -19,7 +22,7 @@ struct Fixture {
     later_sent: (Mutex<bool>, Condvar),
     /// Sets `stop` when the source sends this height.
     stop_at: Option<u32>,
-    stop: std::sync::atomic::AtomicBool,
+    stop: AtomicBool,
 }
 
 impl Fixture {
@@ -32,7 +35,7 @@ impl Fixture {
             reorder: false,
             later_sent: (Mutex::new(false), Condvar::new()),
             stop_at: None,
-            stop: std::sync::atomic::AtomicBool::new(false),
+            stop: AtomicBool::new(false),
         }
     }
 }
@@ -86,7 +89,7 @@ impl HistoricalSource for Fixture {
                 CompactBlockRecord::encoded_size_bound(&block.transactions).unwrap() as u64;
             tx.send(block).map_err(|_| PipelineError::Worker)?;
             if self.stop_at == Some(height) {
-                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.stop.store(true, Ordering::Relaxed);
             }
             if start > 0 {
                 let (lock, ready) = &self.later_sent;
