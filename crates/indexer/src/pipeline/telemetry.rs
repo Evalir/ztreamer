@@ -121,6 +121,9 @@ pub(super) struct SegmentMetrics<'a> {
     start: Instant,
     pub stats: WorkerStats,
     pub success: bool,
+    /// The segment stopped because another thread failed or the pass stopped. It records no
+    /// outcome.
+    pub cancelled: bool,
 }
 
 impl<'a> SegmentMetrics<'a> {
@@ -130,6 +133,7 @@ impl<'a> SegmentMetrics<'a> {
             start: Instant::now(),
             stats: WorkerStats::default(),
             success: false,
+            cancelled: false,
         }
     }
 }
@@ -149,6 +153,9 @@ impl Drop for SegmentMetrics<'_> {
         ]) {
             handle.record(elapsed.as_secs_f64());
         }
-        self.metrics.segment[usize::from(!self.success)].record(self.start.elapsed().as_secs_f64());
+        if !self.cancelled {
+            self.metrics.segment[usize::from(!self.success)]
+                .record(self.start.elapsed().as_secs_f64());
+        }
     }
 }

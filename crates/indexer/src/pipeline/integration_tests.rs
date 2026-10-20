@@ -10,7 +10,7 @@ use crate::{
     Digest,
     codec::{CompactBlockRecord, TreeSizes},
     ingest::OrderedBuilder,
-    parser::{CompactSaplingOutput, CompactShieldedAction, CompactTransaction},
+    parser::{CompactSaplingOutput, CompactShieldedAction, CompactTransaction, ParsedCompactBlock},
 };
 
 struct Fixture {
@@ -18,6 +18,8 @@ struct Fixture {
     fail_at: Option<u32>,
     panic_at: Option<u32>,
     omit: Option<u32>,
+    /// Sends the heights of each segment from the last to the first.
+    descending: bool,
     reorder: bool,
     later_sent: (Mutex<bool>, Condvar),
     /// Sets `stop` when the source sends this height.
@@ -32,6 +34,7 @@ impl Fixture {
             fail_at: None,
             panic_at: None,
             omit: None,
+            descending: false,
             reorder: false,
             later_sent: (Mutex::new(false), Condvar::new()),
             stop_at: None,
@@ -61,7 +64,7 @@ impl HistoricalSource for Fixture {
         end: u32,
         expected_end_hash: Option<block::Hash>,
         _max_source_bytes: usize,
-        tx: &SyncSender<ParsedCompactBlock>,
+        tx: &mut SegmentSender<'_>,
         stats: &mut WorkerStats,
     ) -> Result<(), PipelineError> {
         if self.reorder && start == 0 {
@@ -74,7 +77,11 @@ impl HistoricalSource for Fixture {
                 "a later block must arrive before block zero"
             );
         }
-        for height in start..=end {
+        let mut heights: Vec<_> = (start..=end).collect();
+        if self.descending {
+            heights.reverse();
+        }
+        for height in heights {
             assert_ne!(self.panic_at, Some(height), "injected worker panic");
             if self.fail_at == Some(height) {
                 return Err(PipelineError::MissingBody { height });
@@ -87,7 +94,7 @@ impl HistoricalSource for Fixture {
             stats.transactions += block.transactions.len() as u64;
             stats.bytes +=
                 CompactBlockRecord::encoded_size_bound(&block.transactions).unwrap() as u64;
-            tx.send(block).map_err(|_| PipelineError::Worker)?;
+            tx.send(block)?;
             if self.stop_at == Some(height) {
                 self.stop.store(true, Ordering::Relaxed);
             }
@@ -218,6 +225,136 @@ fn sequential_parallel_and_skewed_ingestion_match_and_reopen() {
     }
 }
 
+/// A channel limit of a few blocks (4 KiB). Workers must wait for the block at `next_height`.
+/// `pending` is then above the channel limit, so the coordinator writes a batch after each
+/// push.
+fn tight(workers: usize) -> PipelineConfig {
+    let config = config(workers);
+    PipelineConfig {
+        max_pending_bytes: crate::codec::MAX_RECORD_BYTES + 4 * 1024,
+        ..config
+    }
+}
+
+/// Stops the test process if the pass does not complete in 30 seconds.
+/// A scoped join cannot stop a thread that is in a deadlock.
+fn sync_within(
+    index: &Index,
+    source: &Fixture,
+    config: PipelineConfig,
+) -> Result<IndexState, PipelineError> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            done_rx.recv_timeout(Duration::from_secs(30))
+        {
+            eprintln!("historical pass did not complete in 30 seconds");
+            std::process::abort();
+        }
+    });
+    let result = HistoricalPipeline::new(index, source, config)
+        .unwrap()
+        .sync();
+    drop(done_tx);
+    watchdog.join().unwrap();
+    result
+}
+
+#[test]
+fn workers_wait_at_a_small_channel_limit() {
+    for workers in [1, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let index = open(&dir, 32 * MIB);
+        let mut source = Fixture::new(1_107);
+        source.reorder = workers > 1;
+        sync_within(&index, &source, tight(workers)).unwrap();
+        verify(&index, source.count);
+    }
+}
+
+#[test]
+fn zero_channel_limit_completes() {
+    // When `max_pending_bytes` is equal to `max_batch_bytes`, validation passes and the
+    // channel limit is zero. Only the block at `next_height` can go through.
+    // The pending bytes must not become more than `max_pending_bytes`.
+    let base = config(8);
+    let config = PipelineConfig {
+        max_pending_bytes: base.max_batch_bytes,
+        ..base
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let source = Fixture::new(1_107);
+    sync_within(&index, &source, config).unwrap();
+    verify(&index, source.count);
+}
+
+#[test]
+fn missing_or_unordered_height_fails_instead_of_waiting() {
+    // With a small channel limit, a missing height makes the other workers wait for it.
+    for omit in [0, 10, 1_050] {
+        let dir = tempfile::tempdir().unwrap();
+        let index = open(&dir, 32 * MIB);
+        let mut source = Fixture::new(1_107);
+        source.omit = Some(omit);
+        assert!(matches!(
+            sync_within(&index, &source, tight(4)),
+            Err(PipelineError::SourceGap { .. })
+        ));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let mut source = Fixture::new(1_107);
+    source.descending = true;
+    assert!(matches!(
+        sync_within(&index, &source, tight(4)),
+        Err(PipelineError::SourceGap { .. })
+    ));
+}
+
+#[test]
+fn failed_worker_stops_workers_that_wait() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let mut source = Fixture::new(1_107);
+    source.fail_at = Some(500);
+    let result = metrics::with_local_recorder(&recorder, || sync_within(&index, &source, tight(8)));
+    assert!(matches!(
+        result,
+        Err(PipelineError::MissingBody { height: 500 })
+    ));
+    // Only the segment that failed records the outcome "error". The segments that the failure
+    // stopped record no outcome.
+    let segment_errors: usize = snapshotter
+        .snapshot()
+        .into_vec()
+        .iter()
+        .filter(|(key, _, _, _)| {
+            key.key().name() == "ztreamer.pipeline.segment.seconds"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "outcome" && label.value() == "error")
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Histogram(samples) => samples.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(segment_errors, 1);
+    let count = index
+        .state()
+        .unwrap()
+        .durable_tip()
+        .map_or(0, |tip| tip.height + 1);
+    assert!(count <= 500);
+    verify(&index, count);
+}
+
 #[test]
 fn historical_pass_seals_a_range_that_the_head_follower_left_in_mutable_rows() {
     // The head follower writes blocks at 10 blocks deep and seals a range at 100 blocks deep.
@@ -249,6 +386,25 @@ fn historical_pass_seals_a_range_that_the_head_follower_left_in_mutable_rows() {
 
 #[test]
 fn stop_ends_the_pass_early_with_a_valid_prefix() {
+    // With one worker, the stop is set after the worker sends 5,000. The coordinator cancels
+    // the channel at its next receive. Up to two more blocks still go through: one that it
+    // receives before it sees the stop, and one that the worker already gives to the channel.
+    // The pass writes those blocks, also from the incomplete range 5,000 to 5,999.
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let mut source = Fixture::new(20_000);
+    source.stop_at = Some(5_000);
+    let state = HistoricalPipeline::new(&index, &source, config(1))
+        .unwrap()
+        .with_stop(&source.stop)
+        .sync()
+        .unwrap();
+    let count = state.durable_tip().map_or(0, |tip| tip.height + 1);
+    assert!((5_001..=5_003).contains(&count), "{count}");
+    verify(&index, count);
+
+    // With more workers, the workers stop in the middle of their segments. The pass writes the
+    // contiguous blocks that it has.
     let dir = tempfile::tempdir().unwrap();
     let index = open(&dir, 32 * MIB);
     let mut source = Fixture::new(20_000);
@@ -258,10 +414,8 @@ fn stop_ends_the_pass_early_with_a_valid_prefix() {
         .with_stop(&source.stop)
         .sync()
         .unwrap();
-    // Each worker completes its segment. The segment of height 5,000 is 4,995 to 5,031, so the
-    // pass writes at least to 5,031, also the blocks of the incomplete range 5,000 to 5,999.
     let count = state.durable_tip().map_or(0, |tip| tip.height + 1);
-    assert!((5_032..source.count).contains(&count), "{count}");
+    assert!(count < source.count, "{count}");
     verify(&index, count);
 }
 

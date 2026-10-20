@@ -38,7 +38,7 @@
 <tr><td>--fetch-workers N</td><td>Historical fetch workers. <s>min(cores, 8)</s></td></tr>
 <tr><td>--source-segment-blocks N</td><td>Consecutive blocks per fetch worker. <s>256</s></td></tr>
 <tr><td>--max-pending-bytes N</td><td>Bytes awaiting ordered ingestion. <s>256 MiB</s></td></tr>
-<tr><td>--max-batch-bytes N</td><td>Index write batch. <s>16 MiB</s></td></tr>
+<tr><td>--max-batch-bytes N</td><td>Index write batch. Fetch workers can have at most <code>--max-pending-bytes</code> minus the larger of this value and 2 MB in flight, plus the one block the index needs next. <s>16 MiB</s></td></tr>
 <tr><td>--ping-very-insecure</td><td>Answer <code>Ping</code>. Testing only.</td></tr>
 <tr><td>--index-only</td><td>Build the index and exit.</td></tr>
 </table>

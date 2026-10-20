@@ -4,14 +4,16 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread,
     time::{Duration, Instant},
 };
 use tracing::info;
 
+mod flow_control;
 mod telemetry;
+use flow_control::{ReadAheadReceiver, ReadAheadSender, SegmentSender};
 use telemetry::{PipelineMetrics, SegmentMetrics};
 
 use zakura_chain::{
@@ -22,12 +24,14 @@ use zakura_state::{TransactionLocation, ZakuraDb};
 
 use crate::{
     index::{Index, IndexError, IndexState},
-    ingest::{IngestError, OrderedBuilder, WriteBatch},
-    parser::{CompactParseError, ParsedCompactBlock, parse_stored_block},
+    ingest::{IngestError, OrderedBuilder, WriteBatch, partial_range_flush_threshold},
+    parser::{CompactParseError, parse_stored_block},
 };
 
 const MIB: usize = 1024 * 1024;
 pub(crate) const MAX_SOURCE_BLOCKS: u32 = 4096;
+/// How often the coordinator checks the stop flag while it waits for a block.
+const STOP_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Default)]
 pub(crate) struct WorkerStats {
@@ -122,7 +126,8 @@ pub enum PipelineError {
 }
 
 /// A segment-oriented source seam: production keeps its native range iterators.
-/// Implementations must send every height in the inclusive range, or return an error.
+/// Implementations must send every height in the inclusive range, in ascending order, or return
+/// an error. A missing height or a height out of order stops the pass with an error.
 pub(crate) trait HistoricalSource: Sync {
     fn tip(&self) -> Option<(Height, block::Hash)>;
     fn block_hash(&self, height: u32) -> Option<block::Hash>;
@@ -133,7 +138,7 @@ pub(crate) trait HistoricalSource: Sync {
         end: u32,
         expected_end_hash: Option<block::Hash>,
         max_source_bytes: usize,
-        parsed_tx: &SyncSender<ParsedCompactBlock>,
+        parsed_tx: &mut SegmentSender<'_>,
         stats: &mut WorkerStats,
     ) -> Result<(), PipelineError>;
 }
@@ -158,7 +163,7 @@ impl HistoricalSource for ZakuraDb {
         end: u32,
         expected_end_hash: Option<block::Hash>,
         max_source_bytes: usize,
-        parsed_tx: &SyncSender<ParsedCompactBlock>,
+        parsed_tx: &mut SegmentSender<'_>,
         stats: &mut WorkerStats,
     ) -> Result<(), PipelineError> {
         let mut headers = self.block_headers_by_height_range(Height(start)..=Height(end));
@@ -276,7 +281,7 @@ impl HistoricalSource for ZakuraDb {
             let started = Instant::now();
             let sent = parsed_tx.send(parsed);
             stats.send_wait += started.elapsed();
-            sent.map_err(|_| PipelineError::Worker)?;
+            sent?;
         }
 
         Ok(())
@@ -370,7 +375,16 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
 
             // `workers` send ParsedCompactBlocks over parsed_tx, `coordinator` below recieves parsed_rx and writes to batch_tx
             // `writer` reads batch_rx and populates index
-            let (parsed_tx, parsed_rx) = sync_channel::<ParsedCompactBlock>(0);
+            // Workers can reserve bytes until the reserved bytes are at the partial-range
+            // threshold. Then only the block at `first_missing_height` can go through (see
+            // `read_ahead_limit` in `build_batches`).
+            let (parsed_tx, parsed_rx) = flow_control::channel(
+                partial_range_flush_threshold(
+                    self.config.max_pending_bytes,
+                    self.config.max_batch_bytes,
+                ),
+                u64::from(start),
+            );
             let (batch_tx, batch_rx) = sync_channel::<WriteBatch>(1);
 
             // single threaded writer receives WriteBatches and writes to Index
@@ -390,14 +404,48 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
             drop(parsed_tx);
 
             // single threaded ordered builder job gives batches to `writer` job
-            let (coordinator_receive_wait, batch_send_wait) =
-                self.build_batches(initial_state, target, parsed_rx, batch_tx)?;
+            let built = self.build_batches(initial_state, target, parsed_rx, batch_tx);
 
+            // `build_batches` dropped its ends of both channels: the workers that wait stop, and
+            // the writer ends after its last batch. Join all threads before returning, so that
+            // the pass gives the error that caused the failure, and `Panic` for a panic.
+            // One failure stops the other workers with `Worker`. Do not keep those errors.
             let mut worker_stats = WorkerStats::default();
+            let mut worker_error = None;
+            let mut worker_stopped = false;
+            let mut panicked = false;
             for worker in workers {
-                worker_stats.add(worker.join().map_err(|_| PipelineError::Panic)??);
+                match worker.join() {
+                    Ok(Ok(stats)) => worker_stats.add(stats),
+                    Ok(Err(PipelineError::Worker)) => worker_stopped = true,
+                    Ok(Err(error)) => {
+                        worker_error.get_or_insert(error);
+                    }
+                    Err(_) => panicked = true,
+                }
             }
-            let (state, write_stats) = writer.join().map_err(|_| PipelineError::Panic)??;
+            let written = writer.join();
+            if panicked || written.is_err() {
+                return Err(PipelineError::Panic);
+            }
+            let written = written.expect("a writer panic returned above");
+            let (coordinator_receive_wait, batch_send_wait) = match built {
+                Ok(waits) => waits,
+                // A send fails only when the writer stopped. Give the error of the writer.
+                Err(PipelineError::Worker) => {
+                    written?;
+                    return Err(worker_error.unwrap_or(PipelineError::Worker));
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(error) = worker_error {
+                return Err(error);
+            }
+            // A stop cancels the channel, so the workers also end with `Worker` then.
+            if worker_stopped && !self.stopped() {
+                return Err(PipelineError::Worker);
+            }
+            let (state, write_stats) = written?;
             // After a stop, the pass can end below the target.
             if state.durable_tip().is_none_or(|tip| tip.height != target) && !self.stopped() {
                 return Err(PipelineError::SourceGap {
@@ -462,7 +510,7 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
         next: Arc<AtomicU64>,
         target: u32,
         tip_hash: block::Hash,
-        parsed_tx: SyncSender<ParsedCompactBlock>,
+        mut parsed_tx: ReadAheadSender,
     ) -> Result<WorkerStats, PipelineError> {
         let _active = self.metrics.worker();
         let mut stats = WorkerStats::default();
@@ -481,14 +529,27 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
                 .saturating_add(u64::from(self.config.source_segment_blocks - 1))
                 .min(u64::from(target)) as u32;
             let mut segment = SegmentMetrics::new(&self.metrics);
-            self.db.process_segment(
-                segment_start as u32,
-                segment_end,
-                (segment_end == target).then_some(tip_hash),
-                self.config.max_source_bytes,
-                &parsed_tx,
-                &mut segment.stats,
-            )?;
+            let mut segment_tx = parsed_tx.segment(segment_start as u32, segment_end);
+            let processed = self
+                .db
+                .process_segment(
+                    segment_start as u32,
+                    segment_end,
+                    (segment_end == target).then_some(tip_hash),
+                    self.config.max_source_bytes,
+                    &mut segment_tx,
+                    &mut segment.stats,
+                )
+                .and_then(|()| segment_tx.finish());
+            if let Err(error) = processed {
+                // `Worker` means that another thread failed or the pass stopped. This segment
+                // did not fail, so it records no outcome.
+                if matches!(error, PipelineError::Worker) {
+                    segment.cancelled = true;
+                }
+                parsed_tx.cancel();
+                return Err(error);
+            }
             segment.success = true;
             stats.add(segment.stats.clone());
         }
@@ -499,33 +560,67 @@ impl<'a, S: HistoricalSource> HistoricalPipeline<'a, S> {
         &self,
         initial_state: IndexState,
         target: u32,
-        parsed_rx: Receiver<ParsedCompactBlock>,
+        parsed_rx: ReadAheadReceiver,
         batch_tx: SyncSender<WriteBatch>,
     ) -> Result<(Duration, Duration), PipelineError> {
         let mut builder = OrderedBuilder::new(initial_state, self.config.max_pending_bytes)?;
+        // Write a batch when `max_batch_bytes` are ready. Also write batches while `pending` is
+        // above the channel limit, so that the next block, which the channel always lets
+        // through, cannot make `pending` more than `max_pending_bytes`.
+        let read_ahead_limit = partial_range_flush_threshold(
+            self.config.max_pending_bytes,
+            self.config.max_batch_bytes,
+        );
         let mut receive_wait = Duration::ZERO;
         let mut send_wait = Duration::ZERO;
+        let mut cancelled = false;
         loop {
+            // After a stop, cancel the channel: each worker stops after its current block and
+            // does not complete its segment. The blocks already sent are still received.
+            if !cancelled && self.stopped() {
+                parsed_rx.cancel();
+                cancelled = true;
+            }
             let started = Instant::now();
-            let Ok(block) = parsed_rx.recv() else {
-                break;
+            let block = match parsed_rx.recv_timeout(STOP_POLL) {
+                Ok(block) => block,
+                Err(RecvTimeoutError::Timeout) => {
+                    receive_wait += started.elapsed();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             };
             let elapsed = started.elapsed();
             receive_wait += elapsed;
             self.metrics.receive_wait.record(elapsed.as_secs_f64());
             builder.push(block)?;
+            parsed_rx.set_first_missing_height(builder.first_missing_height());
             self.metrics.buffer(&builder);
             if builder.ready_bytes() >= self.config.max_batch_bytes
-                && let Some(batch) =
-                    builder.build_batch(Some(target), Some(target), self.config.max_batch_bytes)?
+                || builder.pending_bytes() > read_ahead_limit
             {
-                let started = Instant::now();
-                let sent = batch_tx.send(batch);
-                let elapsed = started.elapsed();
-                self.metrics.batch_wait.record(elapsed.as_secs_f64());
-                send_wait += elapsed;
-                self.metrics.buffer(&builder);
-                sent.map_err(|_| PipelineError::Worker)?;
+                loop {
+                    let pending = builder.pending_bytes();
+                    let Some(batch) = builder.build_batch(
+                        Some(target),
+                        Some(target),
+                        self.config.max_batch_bytes,
+                    )?
+                    else {
+                        break;
+                    };
+                    parsed_rx.release_bytes(pending - builder.pending_bytes());
+                    let started = Instant::now();
+                    let sent = batch_tx.send(batch);
+                    let elapsed = started.elapsed();
+                    self.metrics.batch_wait.record(elapsed.as_secs_f64());
+                    send_wait += elapsed;
+                    self.metrics.buffer(&builder);
+                    sent.map_err(|_| PipelineError::Worker)?;
+                    if builder.pending_bytes() <= read_ahead_limit {
+                        break;
+                    }
+                }
             }
         }
         // After a stop, the workers sent only part of the heights. Write every contiguous block
