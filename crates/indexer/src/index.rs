@@ -488,11 +488,11 @@ impl Index {
             if end > seal_cutoff || end > tip.height {
                 break;
             }
+            // The head follower writes blocks to `mutable_blocks` before it seals them. Because of
+            // this, the range can be complete in `mutable_blocks`, and the batch can start after it.
             let first_new = records.peek().map_or(end + 1, |record| record.height);
-            if first_new > end + 1 {
-                return Err(IndexError::IncompleteRange { start });
-            }
-            let mut range = (start..first_new)
+            let mutable_end = first_new.min(end + 1);
+            let mut range = (start..mutable_end)
                 .map(|height| {
                     self.mutable_blocks
                         .get(&txn, &height)?
@@ -510,7 +510,7 @@ impl Index {
             let encoded = encode_range(&range)?;
             self.sealed_ranges
                 .put(&mut txn, &start, encoded.as_slice())?;
-            for height in start..first_new {
+            for height in start..mutable_end {
                 self.mutable_blocks.delete(&mut txn, &height)?;
             }
             state.sealed_through = Some(end);
@@ -877,6 +877,31 @@ mod tests {
         drop(index);
         let reopened = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         assert_eq!(reopened.state().unwrap(), state);
+    }
+
+    #[test]
+    fn seals_a_range_that_is_complete_in_mutable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        // The tip is 1,060: blocks to 1,050 are durable, but only blocks to 960 can be sealed.
+        // Range 0..=999 stays complete in `mutable_blocks`.
+        let state = index.write(batch(&index, 0..=1_050, 1_060)).unwrap();
+        assert_eq!(state.sealed_through(), None);
+
+        // The next batch starts after the range, and the range can now be sealed.
+        let state = index.write(batch(&index, 1_051..=1_100, 1_110)).unwrap();
+        assert_eq!(state.sealed_through(), Some(999));
+        assert_eq!(state.durable_tip().unwrap().height, 1_100);
+        for height in [0, 537, 999, 1_000, 1_100] {
+            assert_eq!(
+                index.read_block(state.generation(), height).unwrap().height,
+                height
+            );
+        }
+        let txn = index.env.read_txn().unwrap();
+        assert!(index.mutable_blocks.get(&txn, &999).unwrap().is_none());
+        drop(txn);
+        index.verify_continuity().unwrap();
     }
 
     #[test]

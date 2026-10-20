@@ -6,6 +6,7 @@ use super::*;
 use crate::{
     Digest,
     codec::{CompactBlockRecord, TreeSizes},
+    ingest::OrderedBuilder,
     parser::{CompactSaplingOutput, CompactShieldedAction, CompactTransaction},
 };
 
@@ -204,6 +205,35 @@ fn sequential_parallel_and_skewed_ingestion_match_and_reopen() {
         drop(index);
         verify(&open(&dir, 32 * MIB), source.count);
     }
+}
+
+#[test]
+fn historical_pass_seals_a_range_that_the_head_follower_left_in_mutable_rows() {
+    // The head follower writes blocks at 10 blocks deep and seals a range at 100 blocks deep.
+    // At tip 1,098 it has written blocks 0 to 1,088: range 0..=999 is complete in mutable rows,
+    // and it is not sealed. A restart at this point runs the historical pass on this state.
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let mut builder = OrderedBuilder::new(IndexState::default(), 32 * MIB).unwrap();
+    for height in 0..=1_088 {
+        builder.push(prepared(height)).unwrap();
+    }
+    let batch = builder
+        .build_batch(Some(1_088), Some(998), 32 * MIB)
+        .unwrap()
+        .unwrap();
+    let state = index.write(batch).unwrap();
+    assert_eq!(state.sealed_through(), None);
+
+    // The historical pass continues from 1,089. Its seal height is its target, so it seals
+    // range 0..=999, although its first batch starts after that range.
+    let source = Fixture::new(1_200);
+    let state = HistoricalPipeline::new(&index, &source, config(4))
+        .unwrap()
+        .sync()
+        .unwrap_or_else(|error| panic!("historical pass failed: {error}"));
+    assert_eq!(state.sealed_through(), Some(999));
+    verify(&index, source.count);
 }
 
 #[test]
