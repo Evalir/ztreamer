@@ -1,6 +1,10 @@
 //! Generation-pinned LMDB reads, atomic writes, packed ranges, and reorg replacement.
 
-use std::{fs, io, path::Path};
+use std::{
+    fs, io,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use heed::{
     Database, Env, EnvOpenOptions, RoTxn, RwTxn,
@@ -449,7 +453,12 @@ impl Index {
 
     /// Atomically writes a batch and packs newly sealed ranges.
     pub fn write(&self, batch: WriteBatch) -> Result<IndexState, IndexError> {
-        self.write_encoded(batch.encode(1)?)
+        let started = Instant::now();
+        let batch = batch.encode(1)?;
+        let encode = started.elapsed();
+        let state = self.write_encoded(batch)?;
+        WriteStage::Encode.record(encode);
+        Ok(state)
     }
 
     /// Atomically writes a batch with encoded records and packs newly sealed ranges.
@@ -478,10 +487,12 @@ impl Index {
             });
         }
 
+        let mut timer = WriteTimer::start();
         for block in &blocks {
             self.hash_to_height
                 .put(&mut txn, block.hash.as_slice(), &block.height)?;
         }
+        timer.lap(WriteStage::HashIndex);
         let last = blocks.last().expect("the batch is non-empty");
         let tip = BlockId::new(last.height, last.hash);
         let mut blocks = blocks.into_iter().peekable();
@@ -501,6 +512,7 @@ impl Index {
             let first_new = blocks.peek().map_or(end + 1, |block| block.height);
             let mutable_end = first_new.min(end + 1);
             let mut range = self.read_rows_to_seal(&txn, start..mutable_end, start)?;
+            timer.seal_read(range.len());
             while range.len() < RANGE_SIZE as usize {
                 let block = blocks.next().ok_or(IndexError::IncompleteRange { start })?;
                 range.push(block.bytes);
@@ -509,18 +521,24 @@ impl Index {
             let packed = encode_range_from_bytes(&parts)?;
             drop(parts);
             drop(range);
+            timer.lap(WriteStage::SealEncode);
             self.sealed_ranges
                 .put(&mut txn, &start, packed.as_slice())?;
             for height in start..mutable_end {
                 self.mutable_blocks.delete(&mut txn, &height)?;
             }
+            timer.lap(WriteStage::SealPut);
+            timer.bytes(WriteStage::SealPut, packed.len());
             state.sealed_through = Some(end);
             start = end.checked_add(1).ok_or(IndexError::Overflow)?;
         }
+        let wrote_mutable = blocks.peek().is_some();
         for block in blocks {
             self.mutable_blocks
                 .put(&mut txn, &block.height, block.bytes.as_slice())?;
+            timer.bytes(WriteStage::MutablePut, block.bytes.len());
         }
+        timer.lap_if(wrote_mutable, WriteStage::MutablePut);
         state.durable_tip = Some(tip);
         state.tree_sizes = end_tree_sizes;
         state.generation = state
@@ -529,7 +547,10 @@ impl Index {
             .ok_or(IndexError::Overflow)?;
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
+        timer.lap(WriteStage::StatePut);
         txn.commit()?;
+        timer.lap(WriteStage::Commit);
+        timer.finish();
         record_state_metrics(state);
         Ok(state)
     }
@@ -763,6 +784,115 @@ impl Index {
     }
 }
 
+#[derive(Clone, Copy)]
+enum WriteStage {
+    Encode,
+    HashIndex,
+    SealRead,
+    SealEncode,
+    SealPut,
+    MutablePut,
+    StatePut,
+    Commit,
+}
+
+const WRITE_STAGES: usize = 8;
+
+impl WriteStage {
+    const ALL: [Self; WRITE_STAGES] = [
+        Self::Encode,
+        Self::HashIndex,
+        Self::SealRead,
+        Self::SealEncode,
+        Self::SealPut,
+        Self::MutablePut,
+        Self::StatePut,
+        Self::Commit,
+    ];
+
+    fn record(self, elapsed: Duration) {
+        metrics::histogram!("ztreamer.index.write.seconds", "stage" => self.label())
+            .record(elapsed.as_secs_f64());
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Encode => "encode",
+            Self::HashIndex => "hash_index",
+            Self::SealRead => "seal_read",
+            Self::SealEncode => "seal_encode",
+            Self::SealPut => "seal_put",
+            Self::MutablePut => "mutable_put",
+            Self::StatePut => "state_put",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+/// Measures the stages of one [`Index::write`]. [`WriteTimer::finish`] records the times and the
+/// bytes after the commit. A write that fails records nothing here, because its transaction
+/// writes nothing: the pipeline commit metric counts it with the outcome `error`. A stage that
+/// did not run, for example a seal, has no sample.
+struct WriteTimer {
+    last: Instant,
+    elapsed: [Option<Duration>; WRITE_STAGES],
+    bytes: [usize; WRITE_STAGES],
+    seal_read_blocks: usize,
+}
+
+impl WriteTimer {
+    fn start() -> Self {
+        Self {
+            last: Instant::now(),
+            elapsed: [None; WRITE_STAGES],
+            bytes: [0; WRITE_STAGES],
+            seal_read_blocks: 0,
+        }
+    }
+
+    fn lap(&mut self, stage: WriteStage) {
+        let now = Instant::now();
+        *self.elapsed[stage as usize].get_or_insert(Duration::ZERO) += now - self.last;
+        self.last = now;
+    }
+
+    /// Records the stage only if it did work. Else the time goes to no stage.
+    fn lap_if(&mut self, ran: bool, stage: WriteStage) {
+        if ran {
+            self.lap(stage);
+        } else {
+            self.last = Instant::now();
+        }
+    }
+
+    fn seal_read(&mut self, blocks: usize) {
+        self.lap_if(blocks > 0, WriteStage::SealRead);
+        self.seal_read_blocks += blocks;
+    }
+
+    fn bytes(&mut self, stage: WriteStage, bytes: usize) {
+        self.bytes[stage as usize] += bytes;
+    }
+}
+
+impl WriteTimer {
+    /// Records the stages of a write that committed.
+    fn finish(self) {
+        for stage in WriteStage::ALL {
+            let index = stage as usize;
+            if let Some(elapsed) = self.elapsed[index] {
+                stage.record(elapsed);
+            }
+            if self.bytes[index] > 0 {
+                metrics::counter!("ztreamer.index.write.bytes", "stage" => stage.label())
+                    .increment(self.bytes[index] as u64);
+            }
+        }
+        metrics::counter!("ztreamer.index.write.seal_read.blocks")
+            .increment(self.seal_read_blocks as u64);
+    }
+}
+
 fn record_state_metrics(state: IndexState) {
     metrics::gauge!("ztreamer.index.durable.block.height")
         .set(state.durable_tip.map_or(f64::NAN, |tip| tip.height.into()));
@@ -922,6 +1052,49 @@ mod tests {
         assert!(index.mutable_blocks.get(&txn, &999).unwrap().is_none());
         drop(txn);
         index.verify_continuity().unwrap();
+    }
+
+    /// The write stages that one write records, each with one sample.
+    fn write_stages(index: &Index, batch: WriteBatch) -> Vec<String> {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            index.write(batch).unwrap();
+        });
+        let mut stages: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "ztreamer.index.write.seconds")
+            .map(|(key, _, _, value)| {
+                assert!(matches!(value, DebugValue::Histogram(samples) if samples.len() == 1));
+                key.key().labels().next().unwrap().value().to_owned()
+            })
+            .collect();
+        stages.sort();
+        stages
+    }
+
+    #[test]
+    fn write_timings_record_only_stages_that_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        // This write seals no range.
+        let stages = write_stages(&index, batch(&index, 0..=10, 20));
+        assert!(stages.iter().all(|stage| !stage.starts_with("seal_")));
+        assert!(stages.contains(&"mutable_put".to_owned()));
+        assert!(stages.contains(&"state_put".to_owned()));
+
+        // This write seals a range from its batch only. It reads and writes no mutable rows.
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        let stages = write_stages(&index, batch(&index, 0..=999, 1_100));
+        assert!(stages.contains(&"seal_encode".to_owned()));
+        assert!(stages.contains(&"seal_put".to_owned()));
+        assert!(!stages.contains(&"seal_read".to_owned()));
+        assert!(!stages.contains(&"mutable_put".to_owned()));
     }
 
     #[test]
