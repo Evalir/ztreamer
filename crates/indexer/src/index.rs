@@ -10,7 +10,7 @@ use heed::{
 
 use crate::codec::{
     CodecError, CompactBlockRecord, RangeDecoder, StoredBlock, TreeSizes, decode_range_record,
-    encode_range,
+    encode_range_from_bytes,
 };
 use crate::{Digest, ingest::WriteBatch};
 
@@ -492,24 +492,19 @@ impl Index {
             // this, the range can be complete in `mutable_blocks`, and the batch can start after it.
             let first_new = records.peek().map_or(end + 1, |record| record.height);
             let mutable_end = first_new.min(end + 1);
-            let mut range = (start..mutable_end)
-                .map(|height| {
-                    self.mutable_blocks
-                        .get(&txn, &height)?
-                        .ok_or(IndexError::IncompleteRange { start })
-                        .and_then(|bytes| CompactBlockRecord::decode(bytes).map_err(Into::into))
-                })
-                .collect::<Result<Vec<_>, IndexError>>()?;
+            let mut range = self.read_rows_to_seal(&txn, start..mutable_end, start)?;
             while range.len() < RANGE_SIZE as usize {
-                range.push(
-                    records
-                        .next()
-                        .ok_or(IndexError::IncompleteRange { start })?,
-                );
+                let record = records
+                    .next()
+                    .ok_or(IndexError::IncompleteRange { start })?;
+                range.push(record.encode()?);
             }
-            let encoded = encode_range(&range)?;
+            let parts: Vec<_> = range.iter().map(Vec::as_slice).collect();
+            let packed = encode_range_from_bytes(&parts)?;
+            drop(parts);
+            drop(range);
             self.sealed_ranges
-                .put(&mut txn, &start, encoded.as_slice())?;
+                .put(&mut txn, &start, packed.as_slice())?;
             for height in start..mutable_end {
                 self.mutable_blocks.delete(&mut txn, &height)?;
             }
@@ -702,6 +697,28 @@ impl Index {
         Ok(state)
     }
 
+    /// Reads the mutable rows of `heights` for a seal of the range at `start`. A mutable row
+    /// holds the same record bytes that a range holds, so this copies the bytes and does not
+    /// encode them again. It decodes and checks each row once, with the same rules as
+    /// [`CompactBlockRecord::encode`], so that a damaged row does not go into a sealed range.
+    fn read_rows_to_seal(
+        &self,
+        txn: &RoTxn<'_>,
+        heights: std::ops::Range<u32>,
+        start: u32,
+    ) -> Result<Vec<Vec<u8>>, IndexError> {
+        heights
+            .map(|height| {
+                let bytes = self
+                    .mutable_blocks
+                    .get(txn, &height)?
+                    .ok_or(IndexError::IncompleteRange { start })?;
+                CompactBlockRecord::decode(bytes)?.check()?;
+                Ok(bytes.to_vec())
+            })
+            .collect()
+    }
+
     fn pack_sealed_ranges(
         &self,
         txn: &mut RwTxn<'_>,
@@ -727,15 +744,9 @@ impl Index {
             {
                 break;
             }
-            let records = (start..=end)
-                .map(|height| {
-                    self.mutable_blocks
-                        .get(txn, &height)?
-                        .ok_or(IndexError::IncompleteRange { start })
-                        .and_then(|bytes| CompactBlockRecord::decode(bytes).map_err(Into::into))
-                })
-                .collect::<Result<Vec<_>, IndexError>>()?;
-            let encoded = encode_range(&records)?;
+            let range = self.read_rows_to_seal(txn, start..end + 1, start)?;
+            let parts: Vec<_> = range.iter().map(Vec::as_slice).collect();
+            let encoded = encode_range_from_bytes(&parts)?;
             self.sealed_ranges.put(txn, &start, encoded.as_slice())?;
             for height in start..=end {
                 self.mutable_blocks.delete(txn, &height)?;
@@ -828,7 +839,11 @@ fn identity(network: &str, genesis_hash: Digest) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{codec::decode_range_record, ingest::OrderedBuilder, parser::ParsedCompactBlock};
+    use crate::{
+        codec::{ProtobufBlockRecord, decode_range_record, encode_range},
+        ingest::OrderedBuilder,
+        parser::ParsedCompactBlock,
+    };
 
     #[test]
     fn creates_four_databases_and_checks_chain_identity() {
@@ -902,6 +917,70 @@ mod tests {
         assert!(index.mutable_blocks.get(&txn, &999).unwrap().is_none());
         drop(txn);
         index.verify_continuity().unwrap();
+    }
+
+    #[test]
+    fn seal_fails_for_a_damaged_mutable_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        index.write(batch(&index, 0..=10, 20)).unwrap();
+
+        // Change the hash in the payload. The hash in the envelope stays correct.
+        let mut txn = index.env.write_txn().unwrap();
+        let mut row = index
+            .mutable_blocks
+            .get(&txn, &5)
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let payload_hash = row.windows(32).rposition(|w| w == hash(5)).unwrap();
+        row[payload_hash] ^= 1;
+        index.mutable_blocks.put(&mut txn, &5, &row).unwrap();
+        txn.commit().unwrap();
+
+        assert!(matches!(
+            index.write(batch(&index, 11..=1_000, 1_100)),
+            Err(IndexError::Codec(CodecError::InvalidRecord))
+        ));
+        assert_eq!(index.state().unwrap().sealed_through(), None);
+    }
+
+    #[test]
+    fn seal_fails_for_a_mutable_row_without_shielded_data() {
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        index.write(batch(&index, 0..=10, 20)).unwrap();
+
+        // Add a transaction without shielded data to a row. The row still decodes, but
+        // `CompactBlockRecord::encode` does not accept it, so the seal must not accept it.
+        let mut txn = index.env.write_txn().unwrap();
+        let row = index
+            .mutable_blocks
+            .get(&txn, &5)
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let mut block = ProtobufBlockRecord::decode(&row).unwrap().0;
+        block.vtx.push(ztreamer_protocol::proto::CompactTx {
+            txid: vec![7; 32],
+            ..Default::default()
+        });
+        let payload = block.encode_to_vec();
+        let envelope = 1 + size_of::<u32>() + 2 * size_of::<Digest>();
+        let mut damaged = row[..envelope].to_vec();
+        damaged.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        damaged.extend_from_slice(&payload);
+        CompactBlockRecord::decode(&damaged).unwrap();
+        index.mutable_blocks.put(&mut txn, &5, &damaged).unwrap();
+        txn.commit().unwrap();
+
+        assert!(matches!(
+            index.write(batch(&index, 11..=1_000, 1_100)),
+            Err(IndexError::Codec(CodecError::InvalidRecord))
+        ));
+        assert_eq!(index.state().unwrap().sealed_through(), None);
     }
 
     #[test]
