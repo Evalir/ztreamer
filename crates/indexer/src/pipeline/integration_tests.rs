@@ -472,6 +472,46 @@ fn missing_block_cannot_report_a_successful_pass() {
 }
 
 #[test]
+fn writer_failure_stops_the_encode_of_later_batches() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 256 * 1024);
+    let source = Fixture::new(20_000);
+    let result = metrics::with_local_recorder(&recorder, || {
+        HistoricalPipeline::new(&index, &source, config(4))
+            .unwrap()
+            .sync()
+    });
+    assert!(matches!(
+        result,
+        Err(PipelineError::Index(IndexError::Heed(heed::Error::Mdb(
+            heed::MdbError::MapFull
+        ))))
+    ));
+    let values = snapshotter.snapshot().into_vec();
+    let samples = |name: &str| -> usize {
+        values
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == name)
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(samples) => samples.len(),
+                _ => 0,
+            })
+            .sum()
+    };
+    let writes = samples("ztreamer.pipeline.commit.seconds");
+    let encodes = samples("ztreamer.pipeline.encode.seconds");
+    // After the failed write, at most one batch waits in the channel and one is in encode.
+    assert!(
+        encodes <= writes + 2,
+        "{encodes} encodes for {writes} writes"
+    );
+}
+
+#[test]
 fn failed_lmdb_transaction_never_advances_checkpoint_and_can_resume() {
     let dir = tempfile::tempdir().unwrap();
     let index = open(&dir, 256 * 1024);
