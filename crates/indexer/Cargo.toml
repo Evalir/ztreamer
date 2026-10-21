@@ -1,7 +1,11 @@
 [package]
 name = "ztreamer-indexer"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 heed = { version = "0.22.1", default-features = false }

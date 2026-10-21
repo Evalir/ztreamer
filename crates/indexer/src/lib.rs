@@ -1,5 +1,8 @@
 //! Compact block parsing, historical ingestion, LMDB storage, and canonical-head reconciliation.
 
+// Public items are not fully documented yet. Remove this once every `pub` item has a doc comment.
+#![allow(missing_docs)]
+
 pub mod codec;
 pub mod head;
 pub mod index;

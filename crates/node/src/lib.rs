@@ -17,9 +17,15 @@ pub struct NodeClient {
     services: zakurad::node::NodeServices,
 }
 
+impl std::fmt::Debug for NodeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeClient").finish_non_exhaustive()
+    }
+}
+
 impl NodeClient {
     /// Wraps the handles delivered by Zakura's startup readiness hook.
-    pub fn from_services(services: zakurad::node::NodeServices) -> Self {
+    pub const fn from_services(services: zakurad::node::NodeServices) -> Self {
         Self { services }
     }
 
