@@ -21,15 +21,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Nextest
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@nextest
       - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - run: cargo nextest run --workspace --locked
