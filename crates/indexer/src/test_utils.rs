@@ -1,31 +1,38 @@
-//! Deterministic synthetic compact blocks shared by the benchmark targets.
-#![allow(dead_code)]
+//! Deterministic synthetic compact blocks shared by tests and benchmarks.
+//!
+//! Compiled for this crate's own tests and for other crates that enable the `test-utils`
+//! feature in their `[dev-dependencies]`.
 
-use zakura_chain::{block::Block, serialization::ZcashDeserialize as _};
-use zakura_test::vectors::{
-    BLOCK_MAINNET_949496_BYTES, BLOCK_MAINNET_1687121_BYTES, BLOCK_TESTNET_1842421_BYTES,
-};
-use ztreamer_indexer::{
+use crate::{
     Digest,
     codec::{CompactBlockRecord, TreeSizes},
     index::{Index, IndexState},
     ingest::OrderedBuilder,
-    parser::{CompactTransaction, ParsedCompactBlock, RawIndexBlock, parse_block},
+    parser::parse_block,
+    types::{CompactTransaction, ParsedCompactBlock, RawIndexBlock},
+};
+use zakura_chain::{
+    block::{self, Block},
+    serialization::ZcashDeserialize as _,
+    transaction,
+};
+use zakura_test::vectors::{
+    BLOCK_MAINNET_949496_BYTES, BLOCK_MAINNET_1687121_BYTES, BLOCK_TESTNET_1842421_BYTES,
 };
 
+/// A deterministic block hash: the big-endian height in the first four bytes, zeros after.
 pub fn hash(height: u32) -> Digest {
     let mut hash = [0; 32];
     hash[..4].copy_from_slice(&height.to_be_bytes());
     hash
 }
 
+/// The shielded transactions from three real mainnet and testnet block vectors.
 pub fn shielded_transactions() -> Vec<CompactTransaction> {
     let mut transactions = Vec::new();
-    for bytes in [
-        &*BLOCK_MAINNET_949496_BYTES,
-        &*BLOCK_MAINNET_1687121_BYTES,
-        &*BLOCK_TESTNET_1842421_BYTES,
-    ] {
+    for bytes in
+        [&*BLOCK_MAINNET_949496_BYTES, &*BLOCK_MAINNET_1687121_BYTES, &*BLOCK_TESTNET_1842421_BYTES]
+    {
         let block = Block::zcash_deserialize(bytes.as_slice()).unwrap();
         transactions.extend(
             parse_block(&RawIndexBlock {
@@ -41,6 +48,7 @@ pub fn shielded_transactions() -> Vec<CompactTransaction> {
     transactions
 }
 
+/// A record at `height` that chains onto [`hash`] of the previous height.
 pub fn record(height: u32, transactions: Vec<CompactTransaction>) -> CompactBlockRecord {
     CompactBlockRecord {
         height,
@@ -52,6 +60,7 @@ pub fn record(height: u32, transactions: Vec<CompactTransaction>) -> CompactBloc
     }
 }
 
+/// Converts a record into the parser output that produces it, with matching tree additions.
 pub fn parsed(record: CompactBlockRecord) -> ParsedCompactBlock {
     ParsedCompactBlock {
         height: record.height,
@@ -77,7 +86,9 @@ pub fn parsed(record: CompactBlockRecord) -> ParsedCompactBlock {
     }
 }
 
-// Deliberately mixed sizes, not a claim about mainnet's statistical distribution.
+/// `count` records with a mix of empty, small and heavy blocks and running tree sizes.
+///
+/// Deliberately mixed sizes, not a claim about mainnet's statistical distribution.
 pub fn mixed_records(count: u32) -> Vec<CompactBlockRecord> {
     let shielded = shielded_transactions();
     let mut sizes = TreeSizes::default();
@@ -105,6 +116,7 @@ pub fn mixed_records(count: u32) -> Vec<CompactBlockRecord> {
         .collect()
 }
 
+/// Writes `records` into `index` in batches and returns the resulting state.
 pub fn populate(
     index: &Index,
     records: &[CompactBlockRecord],
@@ -116,12 +128,39 @@ pub fn populate(
     for record in records {
         builder.push(parsed(record.clone())).unwrap();
     }
-    while let Some(batch) = builder
-        .build_batch(Some(tip), seal_through, 16 * 1024 * 1024)
-        .unwrap()
+    while let Some(batch) = builder.build_batch(Some(tip), seal_through, 16 * 1024 * 1024).unwrap()
     {
         state = index.write(batch).unwrap();
     }
     assert_eq!(state.durable_tip().unwrap().height, tip);
     state
+}
+
+/// An empty block at `height` that chains onto [`hash`] of the previous height.
+pub fn prepared(height: u32) -> ParsedCompactBlock {
+    ParsedCompactBlock {
+        height,
+        hash: hash(height),
+        previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
+        time: height,
+        transactions: Vec::new(),
+        sapling_additions: 0,
+        orchard_additions: 0,
+        ironwood_additions: 0,
+    }
+}
+
+/// A minimal raw block at `height`: a 140-byte header prefix that chains onto [`hash`] of the
+/// previous height, plus one empty transaction.
+pub fn raw_block(height: u32) -> RawIndexBlock {
+    let mut bytes = vec![0; 140];
+    bytes[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
+    bytes[100..104].copy_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&[0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    RawIndexBlock {
+        height: block::Height(height),
+        hash: block::Hash(hash(height)),
+        bytes,
+        txids: vec![transaction::Hash(hash(height))],
+    }
 }

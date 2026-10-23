@@ -1,10 +1,6 @@
 //! Generation-pinned LMDB reads, atomic writes, packed ranges, and reorg replacement.
 
-use std::{
-    fs, io,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{fs, io, path::Path, time::Instant};
 
 use heed::{
     Database, Env, EnvOpenOptions, RoTxn, RwTxn,
@@ -21,13 +17,16 @@ use crate::{
     ingest::{EncodedBatch, WriteBatch},
 };
 
+mod state;
+mod telemetry;
+use state::{encode_state, identity, read_state};
+use telemetry::{WriteStage, WriteTimer, record_state_metrics};
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const RANGE_SIZE: u32 = 1_000;
 pub const PERSIST_DEPTH: u32 = 10;
 pub const SEAL_DEPTH: u32 = 100;
 
-const STATE_FORMAT_VERSION: u8 = 1;
-const STATE_BYTES: usize = 62;
 const STATE: &[u8] = b"state";
 
 type HeightDb = Database<U32<BigEndian>, Bytes>;
@@ -62,27 +61,27 @@ pub struct IndexState {
 }
 
 impl IndexState {
-    /// Returns the highest contiguous compact block commited to
-    /// [`Index::mutable_blocks`]
-    pub fn durable_tip(&self) -> Option<BlockId> {
+    /// Returns the highest contiguous compact block committed to the
+    /// `mutable_blocks` database.
+    pub const fn durable_tip(&self) -> Option<BlockId> {
         self.durable_tip
     }
 
-    /// Returns the highest height committed to a [`Index::sealed_ranges`].
+    /// Returns the highest height committed to the `sealed_ranges` database.
     ///
-    /// Blocks above this height live in [`Index::mutable_blocks`].
-    pub fn sealed_through(&self) -> Option<u32> {
+    /// Blocks above this height live in the `mutable_blocks` database.
+    pub const fn sealed_through(&self) -> Option<u32> {
         self.sealed_through
     }
 
     /// Identifies the exact committed revision of the durable index that an
     /// [`IndexState`] describes.
-    pub fn generation(&self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
     /// Cumulative [`TreeSizes`] at the end of [`IndexState::durable_tip`]
-    pub fn tree_sizes(&self) -> TreeSizes {
+    pub const fn tree_sizes(&self) -> TreeSizes {
         self.tree_sizes
     }
 }
@@ -128,6 +127,12 @@ pub struct Index {
     hash_to_height: Database<Bytes, U32<BigEndian>>,
 }
 
+impl std::fmt::Debug for Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Index").field("path", &self.env.path()).finish_non_exhaustive()
+    }
+}
+
 impl Index {
     /// Opens the index and rejects an environment created for another chain or format.
     pub fn open(
@@ -138,12 +143,8 @@ impl Index {
     ) -> Result<Self, IndexError> {
         fs::create_dir_all(path.as_ref())?;
         // SAFETY: callers must not open this path with incompatible LMDB options in this process.
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(map_size)
-                .max_dbs(4)
-                .open(path.as_ref())?
-        };
+        let env =
+            unsafe { EnvOpenOptions::new().map_size(map_size).max_dbs(4).open(path.as_ref())? };
         let mut txn = env.write_txn()?;
         let metadata = env.create_database(&mut txn, Some("metadata"))?;
         let sealed_ranges = env.create_database(&mut txn, Some("sealed_ranges"))?;
@@ -158,13 +159,7 @@ impl Index {
         }
         txn.commit()?;
 
-        let index = Self {
-            env,
-            metadata,
-            sealed_ranges,
-            mutable_blocks,
-            hash_to_height,
-        };
+        let index = Self { env, metadata, sealed_ranges, mutable_blocks, hash_to_height };
         index.verify_continuity()?;
         record_state_metrics(index.state()?);
         Ok(index)
@@ -262,9 +257,7 @@ impl Index {
         end: u32,
         mut emit: impl FnMut(T) -> bool,
     ) -> Result<(), IndexError> {
-        let tip = state
-            .durable_tip
-            .ok_or(IndexError::Coverage { height: start })?;
+        let tip = state.durable_tip.ok_or(IndexError::Coverage { height: start })?;
         if start > tip.height {
             return Err(IndexError::Coverage { height: start });
         }
@@ -310,10 +303,7 @@ impl Index {
     fn read_generation(&self, txn: &RoTxn<'_>, generation: u64) -> Result<IndexState, IndexError> {
         let state = read_state(self.metadata, txn)?;
         if state.generation != generation {
-            return Err(IndexError::Generation {
-                expected: generation,
-                actual: state.generation,
-            });
+            return Err(IndexError::Generation { expected: generation, actual: state.generation });
         }
         Ok(state)
     }
@@ -330,19 +320,13 @@ impl Index {
         if state.sealed_through.is_some_and(|sealed| height <= sealed) {
             let start = height - height % RANGE_SIZE;
             return RangeDecoder::new(
-                self.sealed_ranges
-                    .get(txn, &start)?
-                    .ok_or(IndexError::Coverage { height })?,
+                self.sealed_ranges.get(txn, &start)?.ok_or(IndexError::Coverage { height })?,
             )?
             .record_as((height - start) as usize)
             .map_err(Into::into);
         }
-        T::decode(
-            self.mutable_blocks
-                .get(txn, &height)?
-                .ok_or(IndexError::Coverage { height })?,
-        )
-        .map_err(Into::into)
+        T::decode(self.mutable_blocks.get(txn, &height)?.ok_or(IndexError::Coverage { height })?)
+            .map_err(Into::into)
     }
 
     /// Checks sealed-range summaries and every mutable suffix row without rescanning sealed blocks.
@@ -359,9 +343,7 @@ impl Index {
             return Ok(());
         };
 
-        let sealed_blocks = state
-            .sealed_through
-            .map_or(0, |height| u64::from(height) + 1);
+        let sealed_blocks = state.sealed_through.map_or(0, |height| u64::from(height) + 1);
         if self.sealed_ranges.len(&txn)? != sealed_blocks / u64::from(RANGE_SIZE)
             || self.mutable_blocks.len(&txn)? != u64::from(tip.height) + 1 - sealed_blocks
             || self.hash_to_height.len(&txn)? != u64::from(tip.height) + 1
@@ -374,9 +356,7 @@ impl Index {
         for entry in self.sealed_ranges.iter(&txn)? {
             let (start, bytes) = entry?;
             if u64::from(start) != next_height {
-                return Err(IndexError::Continuity {
-                    height: next_height as u32,
-                });
+                return Err(IndexError::Continuity { height: next_height as u32 });
             }
             let first = decode_range_record(bytes, 0)?;
             let last = decode_range_record(bytes, RANGE_SIZE as usize - 1)?;
@@ -389,17 +369,13 @@ impl Index {
             next_height += u64::from(RANGE_SIZE);
         }
         if next_height != sealed_blocks {
-            return Err(IndexError::Continuity {
-                height: next_height as u32,
-            });
+            return Err(IndexError::Continuity { height: next_height as u32 });
         }
 
         for entry in self.mutable_blocks.iter(&txn)? {
             let (height, bytes) = entry?;
             if u64::from(height) != next_height {
-                return Err(IndexError::Continuity {
-                    height: next_height as u32,
-                });
+                return Err(IndexError::Continuity { height: next_height as u32 });
             }
             let record = CompactBlockRecord::decode(bytes)?;
             if record.height != height
@@ -411,10 +387,7 @@ impl Index {
             previous_hash = Some(record.hash);
             next_height += 1;
         }
-        let tip_record = if state
-            .sealed_through
-            .is_some_and(|sealed| tip.height <= sealed)
-        {
+        let tip_record = if state.sealed_through.is_some_and(|sealed| tip.height <= sealed) {
             let start = tip.height - tip.height % RANGE_SIZE;
             decode_range_record(
                 self.sealed_ranges
@@ -444,9 +417,7 @@ impl Index {
         record: &CompactBlockRecord,
     ) -> Result<(), IndexError> {
         if self.hash_to_height.get(txn, record.hash.as_slice())? != Some(record.height) {
-            return Err(IndexError::HashIndex {
-                height: record.height,
-            });
+            return Err(IndexError::HashIndex { height: record.height });
         }
         Ok(())
     }
@@ -465,12 +436,7 @@ impl Index {
     pub(crate) fn write_encoded(&self, batch: EncodedBatch) -> Result<IndexState, IndexError> {
         let mut txn = self.env.write_txn()?;
         let mut state = read_state(self.metadata, &txn)?;
-        let EncodedBatch {
-            base_generation,
-            seal_through,
-            blocks,
-            end_tree_sizes,
-        } = batch;
+        let EncodedBatch { base_generation, seal_through, blocks, end_tree_sizes } = batch;
         let first = blocks.first().expect("builders never emit empty batches");
         let expected_height = match state.durable_tip {
             Some(tip) => tip.height.checked_add(1).ok_or(IndexError::Overflow)?,
@@ -478,32 +444,25 @@ impl Index {
         };
         if state.generation != base_generation
             || first.height != expected_height
-            || state
-                .durable_tip
-                .is_some_and(|tip| first.previous_hash != tip.hash)
+            || state.durable_tip.is_some_and(|tip| first.previous_hash != tip.hash)
         {
-            return Err(IndexError::StaleBatch {
-                batch_generation: base_generation,
-            });
+            return Err(IndexError::StaleBatch { batch_generation: base_generation });
         }
 
         let mut timer = WriteTimer::start();
         for block in &blocks {
-            self.hash_to_height
-                .put(&mut txn, block.hash.as_slice(), &block.height)?;
+            self.hash_to_height.put(&mut txn, block.hash.as_slice(), &block.height)?;
         }
         timer.lap(WriteStage::HashIndex);
         let last = blocks.last().expect("the batch is non-empty");
         let tip = BlockId::new(last.height, last.hash);
         let mut blocks = blocks.into_iter().peekable();
-        let mut start = state.sealed_through.map_or(Ok(0), |height| {
-            height.checked_add(1).ok_or(IndexError::Overflow)
-        })?;
+        let mut start = state
+            .sealed_through
+            .map_or(Ok(0), |height| height.checked_add(1).ok_or(IndexError::Overflow))?;
 
         while let Some(seal_cutoff) = seal_through {
-            let end = start
-                .checked_add(RANGE_SIZE - 1)
-                .ok_or(IndexError::Overflow)?;
+            let end = start.checked_add(RANGE_SIZE - 1).ok_or(IndexError::Overflow)?;
             if end > seal_cutoff || end > tip.height {
                 break;
             }
@@ -522,8 +481,7 @@ impl Index {
             drop(parts);
             drop(range);
             timer.lap(WriteStage::SealEncode);
-            self.sealed_ranges
-                .put(&mut txn, &start, packed.as_slice())?;
+            self.sealed_ranges.put(&mut txn, &start, packed.as_slice())?;
             for height in start..mutable_end {
                 self.mutable_blocks.delete(&mut txn, &height)?;
             }
@@ -534,17 +492,13 @@ impl Index {
         }
         let wrote_mutable = blocks.peek().is_some();
         for block in blocks {
-            self.mutable_blocks
-                .put(&mut txn, &block.height, block.bytes.as_slice())?;
+            self.mutable_blocks.put(&mut txn, &block.height, block.bytes.as_slice())?;
             timer.bytes(WriteStage::MutablePut, block.bytes.len());
         }
         timer.lap_if(wrote_mutable, WriteStage::MutablePut);
         state.durable_tip = Some(tip);
         state.tree_sizes = end_tree_sizes;
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .ok_or(IndexError::Overflow)?;
+        state.generation = state.generation.checked_add(1).ok_or(IndexError::Overflow)?;
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         timer.lap(WriteStage::StatePut);
@@ -566,23 +520,14 @@ impl Index {
         let mut txn = self.env.write_txn()?;
         let mut state = read_state(self.metadata, &txn)?;
         if state.generation != base_generation {
-            return Err(IndexError::StaleBatch {
-                batch_generation: base_generation,
-            });
+            return Err(IndexError::StaleBatch { batch_generation: base_generation });
         }
-        if state
-            .sealed_through
-            .is_some_and(|sealed| ancestor.height < sealed)
-        {
-            return Err(IndexError::Sealed {
-                height: ancestor.height + 1,
-            });
+        if state.sealed_through.is_some_and(|sealed| ancestor.height < sealed) {
+            return Err(IndexError::Sealed { height: ancestor.height + 1 });
         }
         let ancestor_record: CompactBlockRecord = self.read_record(&txn, state, ancestor.height)?;
         if ancestor_record.hash != ancestor.hash {
-            return Err(IndexError::Replacement {
-                height: ancestor.height,
-            });
+            return Err(IndexError::Replacement { height: ancestor.height });
         }
 
         let delete_start = ancestor.height.checked_add(1).ok_or(IndexError::Overflow)?;
@@ -590,9 +535,7 @@ impl Index {
         let mut previous_hash = ancestor.hash;
         for record in &records {
             if record.height != expected_height || record.previous_hash != previous_hash {
-                return Err(IndexError::Replacement {
-                    height: expected_height,
-                });
+                return Err(IndexError::Replacement { height: expected_height });
             }
             expected_height = expected_height.checked_add(1).ok_or(IndexError::Overflow)?;
             previous_hash = record.hash;
@@ -600,41 +543,28 @@ impl Index {
 
         let old_tip = state.durable_tip.ok_or(IndexError::Metadata)?;
         if ancestor.height > old_tip.height {
-            return Err(IndexError::Replacement {
-                height: ancestor.height,
-            });
+            return Err(IndexError::Replacement { height: ancestor.height });
         }
         for height in delete_start..=old_tip.height {
-            let bytes = self
-                .mutable_blocks
-                .get(&txn, &height)?
-                .ok_or(IndexError::Continuity { height })?;
+            let bytes =
+                self.mutable_blocks.get(&txn, &height)?.ok_or(IndexError::Continuity { height })?;
             let old = CompactBlockRecord::decode(bytes)?;
             self.hash_to_height.delete(&mut txn, old.hash.as_slice())?;
             self.mutable_blocks.delete(&mut txn, &height)?;
         }
         for record in &records {
             let encoded = record.encode()?;
-            self.mutable_blocks
-                .put(&mut txn, &record.height, encoded.as_slice())?;
-            self.hash_to_height
-                .put(&mut txn, record.hash.as_slice(), &record.height)?;
+            self.mutable_blocks.put(&mut txn, &record.height, encoded.as_slice())?;
+            self.hash_to_height.put(&mut txn, record.hash.as_slice(), &record.height)?;
         }
 
-        let tip = records
-            .last()
-            .map_or(ancestor, |record| BlockId::new(record.height, record.hash));
+        let tip =
+            records.last().map_or(ancestor, |record| BlockId::new(record.height, record.hash));
         state.durable_tip = Some(tip);
-        state.tree_sizes = records
-            .last()
-            .map_or(ancestor_record.end_tree_sizes, |record| {
-                record.end_tree_sizes
-            });
+        state.tree_sizes =
+            records.last().map_or(ancestor_record.end_tree_sizes, |record| record.end_tree_sizes);
         self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .ok_or(IndexError::Overflow)?;
+        state.generation = state.generation.checked_add(1).ok_or(IndexError::Overflow)?;
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
@@ -653,16 +583,12 @@ impl Index {
         let mut txn = self.env.write_txn()?;
         let mut state = read_state(self.metadata, &txn)?;
         if state.generation != base_generation {
-            return Err(IndexError::StaleBatch {
-                batch_generation: base_generation,
-            });
+            return Err(IndexError::StaleBatch { batch_generation: base_generation });
         }
         let old_tip = state.durable_tip.ok_or(IndexError::Metadata)?;
         let common: CompactBlockRecord = self.read_record(&txn, state, common_ancestor.height)?;
         if common.hash != common_ancestor.hash {
-            return Err(IndexError::Replacement {
-                height: common_ancestor.height,
-            });
+            return Err(IndexError::Replacement { height: common_ancestor.height });
         }
 
         let affected_start = common_ancestor.height - common_ancestor.height % RANGE_SIZE;
@@ -676,14 +602,11 @@ impl Index {
             pair[0].height.checked_add(1) != Some(pair[1].height)
                 || pair[1].previous_hash != pair[0].hash
         }) {
-            return Err(IndexError::Replacement {
-                height: common_ancestor.height,
-            });
+            return Err(IndexError::Replacement { height: common_ancestor.height });
         }
 
         for record in &old_records {
-            self.hash_to_height
-                .delete(&mut txn, record.hash.as_slice())?;
+            self.hash_to_height.delete(&mut txn, record.hash.as_slice())?;
             self.mutable_blocks.delete(&mut txn, &record.height)?;
         }
         if let Some(old_sealed) = state.sealed_through
@@ -694,28 +617,20 @@ impl Index {
                 self.sealed_ranges.delete(&mut txn, &start)?;
                 start = start.checked_add(RANGE_SIZE).ok_or(IndexError::Overflow)?;
             }
-            state.sealed_through = affected_start
-                .checked_sub(1)
-                .filter(|height| *height <= old_sealed);
+            state.sealed_through =
+                affected_start.checked_sub(1).filter(|height| *height <= old_sealed);
         }
 
         for record in &canonical {
             let encoded = record.encode()?;
-            self.mutable_blocks
-                .put(&mut txn, &record.height, encoded.as_slice())?;
-            self.hash_to_height
-                .put(&mut txn, record.hash.as_slice(), &record.height)?;
+            self.mutable_blocks.put(&mut txn, &record.height, encoded.as_slice())?;
+            self.hash_to_height.put(&mut txn, record.hash.as_slice(), &record.height)?;
         }
-        let tip = canonical
-            .last()
-            .expect("the common-ancestor prefix is non-empty");
+        let tip = canonical.last().expect("the common-ancestor prefix is non-empty");
         state.durable_tip = Some(BlockId::new(tip.height, tip.hash));
         state.tree_sizes = tip.end_tree_sizes;
         self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .ok_or(IndexError::Overflow)?;
+        state.generation = state.generation.checked_add(1).ok_or(IndexError::Overflow)?;
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
@@ -754,19 +669,15 @@ impl Index {
         let Some(seal_cutoff) = seal_cutoff else {
             return Ok(());
         };
-        let mut start = state.sealed_through.map_or(Ok(0), |height| {
-            height.checked_add(1).ok_or(IndexError::Overflow)
-        })?;
+        let mut start = state
+            .sealed_through
+            .map_or(Ok(0), |height| height.checked_add(1).ok_or(IndexError::Overflow))?;
 
         loop {
-            let end = start
-                .checked_add(RANGE_SIZE - 1)
-                .ok_or(IndexError::Overflow)?;
+            let end = start.checked_add(RANGE_SIZE - 1).ok_or(IndexError::Overflow)?;
             // exit early if the range is not ready to be sealed yet
             if end > seal_cutoff
-                || state
-                    .durable_tip
-                    .is_none_or(|durable_tip| end > durable_tip.height)
+                || state.durable_tip.is_none_or(|durable_tip| end > durable_tip.height)
             {
                 break;
             }
@@ -784,200 +695,13 @@ impl Index {
     }
 }
 
-#[derive(Clone, Copy)]
-enum WriteStage {
-    Encode,
-    HashIndex,
-    SealRead,
-    SealEncode,
-    SealPut,
-    MutablePut,
-    StatePut,
-    Commit,
-}
-
-const WRITE_STAGES: usize = 8;
-
-impl WriteStage {
-    const ALL: [Self; WRITE_STAGES] = [
-        Self::Encode,
-        Self::HashIndex,
-        Self::SealRead,
-        Self::SealEncode,
-        Self::SealPut,
-        Self::MutablePut,
-        Self::StatePut,
-        Self::Commit,
-    ];
-
-    fn record(self, elapsed: Duration) {
-        metrics::histogram!("ztreamer.index.write.seconds", "stage" => self.label())
-            .record(elapsed.as_secs_f64());
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Encode => "encode",
-            Self::HashIndex => "hash_index",
-            Self::SealRead => "seal_read",
-            Self::SealEncode => "seal_encode",
-            Self::SealPut => "seal_put",
-            Self::MutablePut => "mutable_put",
-            Self::StatePut => "state_put",
-            Self::Commit => "commit",
-        }
-    }
-}
-
-/// Measures the stages of one [`Index::write`]. [`WriteTimer::finish`] records the times and the
-/// bytes after the commit. A write that fails records nothing here, because its transaction
-/// writes nothing: the pipeline commit metric counts it with the outcome `error`. A stage that
-/// did not run, for example a seal, has no sample.
-struct WriteTimer {
-    last: Instant,
-    elapsed: [Option<Duration>; WRITE_STAGES],
-    bytes: [usize; WRITE_STAGES],
-    seal_read_blocks: usize,
-}
-
-impl WriteTimer {
-    fn start() -> Self {
-        Self {
-            last: Instant::now(),
-            elapsed: [None; WRITE_STAGES],
-            bytes: [0; WRITE_STAGES],
-            seal_read_blocks: 0,
-        }
-    }
-
-    fn lap(&mut self, stage: WriteStage) {
-        let now = Instant::now();
-        *self.elapsed[stage as usize].get_or_insert(Duration::ZERO) += now - self.last;
-        self.last = now;
-    }
-
-    /// Records the stage only if it did work. Else the time goes to no stage.
-    fn lap_if(&mut self, ran: bool, stage: WriteStage) {
-        if ran {
-            self.lap(stage);
-        } else {
-            self.last = Instant::now();
-        }
-    }
-
-    fn seal_read(&mut self, blocks: usize) {
-        self.lap_if(blocks > 0, WriteStage::SealRead);
-        self.seal_read_blocks += blocks;
-    }
-
-    fn bytes(&mut self, stage: WriteStage, bytes: usize) {
-        self.bytes[stage as usize] += bytes;
-    }
-}
-
-impl WriteTimer {
-    /// Records the stages of a write that committed.
-    fn finish(self) {
-        for stage in WriteStage::ALL {
-            let index = stage as usize;
-            if let Some(elapsed) = self.elapsed[index] {
-                stage.record(elapsed);
-            }
-            if self.bytes[index] > 0 {
-                metrics::counter!("ztreamer.index.write.bytes", "stage" => stage.label())
-                    .increment(self.bytes[index] as u64);
-            }
-        }
-        metrics::counter!("ztreamer.index.write.seal_read.blocks")
-            .increment(self.seal_read_blocks as u64);
-    }
-}
-
-fn record_state_metrics(state: IndexState) {
-    metrics::gauge!("ztreamer.index.durable.block.height")
-        .set(state.durable_tip.map_or(f64::NAN, |tip| tip.height.into()));
-    metrics::gauge!("ztreamer.index.sealed.block.height")
-        .set(state.sealed_through.map_or(f64::NAN, Into::into));
-    metrics::gauge!("ztreamer.index.generation").set(state.generation as f64);
-}
-
-fn read_state(metadata: Database<Bytes, Bytes>, txn: &RoTxn<'_>) -> Result<IndexState, IndexError> {
-    metadata
-        .get(txn, STATE)?
-        .map(decode_state)
-        .transpose()
-        .map(Option::unwrap_or_default)
-}
-
-fn encode_state(state: IndexState) -> Vec<u8> {
-    let tip = state
-        .durable_tip
-        .expect("only non-empty index state is persisted");
-    let mut bytes = Vec::with_capacity(STATE_BYTES);
-    bytes.push(STATE_FORMAT_VERSION);
-    bytes.extend_from_slice(&tip.height.to_be_bytes());
-    bytes.extend_from_slice(&tip.hash);
-    bytes.push(u8::from(state.sealed_through.is_some()));
-    bytes.extend_from_slice(&state.sealed_through.unwrap_or_default().to_be_bytes());
-    bytes.extend_from_slice(&state.generation.to_be_bytes());
-    bytes.extend_from_slice(&state.tree_sizes.sapling.to_be_bytes());
-    bytes.extend_from_slice(&state.tree_sizes.orchard.to_be_bytes());
-    bytes.extend_from_slice(&state.tree_sizes.ironwood.to_be_bytes());
-    bytes
-}
-
-fn decode_state(bytes: &[u8]) -> Result<IndexState, IndexError> {
-    if bytes.len() != STATE_BYTES || bytes[0] != STATE_FORMAT_VERSION || bytes[37] > 1 {
-        return Err(IndexError::Metadata);
-    }
-    let u32_at = |start| {
-        u32::from_be_bytes(
-            bytes[start..start + 4]
-                .try_into()
-                .expect("state length was checked"),
-        )
-    };
-    let tip = BlockId::new(
-        u32_at(1),
-        bytes[5..37].try_into().expect("state length was checked"),
-    );
-    let sealed_through = (bytes[37] == 1).then(|| u32_at(38));
-    if sealed_through
-        .is_some_and(|sealed| sealed > tip.height || sealed % RANGE_SIZE != RANGE_SIZE - 1)
-    {
-        return Err(IndexError::Metadata);
-    }
-    Ok(IndexState {
-        durable_tip: Some(tip),
-        sealed_through,
-        generation: u64::from_be_bytes(bytes[42..50].try_into().expect("state length was checked")),
-        tree_sizes: TreeSizes {
-            sapling: u32_at(50),
-            orchard: u32_at(54),
-            ironwood: u32_at(58),
-        },
-    })
-}
-
-fn identity(network: &str, genesis_hash: Digest) -> Vec<u8> {
-    [
-        SCHEMA_VERSION.to_be_bytes().as_slice(),
-        RANGE_SIZE.to_be_bytes().as_slice(),
-        PERSIST_DEPTH.to_be_bytes().as_slice(),
-        SEAL_DEPTH.to_be_bytes().as_slice(),
-        genesis_hash.as_slice(),
-        network.as_bytes(),
-    ]
-    .concat()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{hash, prepared};
     use crate::{
         codec::{ProtobufBlockRecord, decode_range_record},
         ingest::OrderedBuilder,
-        parser::ParsedCompactBlock,
     };
 
     #[test]
@@ -1007,21 +731,10 @@ mod tests {
         assert!(index.mutable_blocks.get(&txn, &1_000).unwrap().is_some());
         let range = index.sealed_ranges.get(&txn, &0).unwrap().unwrap();
         assert_eq!(decode_range_record(range, 537).unwrap().height, 537);
-        assert_eq!(
-            index
-                .hash_to_height
-                .get(&txn, hash(537).as_slice())
-                .unwrap(),
-            Some(537)
-        );
+        assert_eq!(index.hash_to_height.get(&txn, hash(537).as_slice()).unwrap(), Some(537));
         drop(txn);
 
-        assert!(matches!(
-            index.write(stale),
-            Err(IndexError::StaleBatch {
-                batch_generation: 0
-            })
-        ));
+        assert!(matches!(index.write(stale), Err(IndexError::StaleBatch { batch_generation: 0 })));
         assert_eq!(index.state().unwrap(), state);
 
         drop(index);
@@ -1043,10 +756,7 @@ mod tests {
         assert_eq!(state.sealed_through(), Some(999));
         assert_eq!(state.durable_tip().unwrap().height, 1_100);
         for height in [0, 537, 999, 1_000, 1_100] {
-            assert_eq!(
-                index.read_block(state.generation(), height).unwrap().height,
-                height
-            );
+            assert_eq!(index.read_block(state.generation(), height).unwrap().height, height);
         }
         let txn = index.env.read_txn().unwrap();
         assert!(index.mutable_blocks.get(&txn, &999).unwrap().is_none());
@@ -1105,12 +815,7 @@ mod tests {
 
         // Change the hash in the payload. The hash in the envelope stays correct.
         let mut txn = index.env.write_txn().unwrap();
-        let mut row = index
-            .mutable_blocks
-            .get(&txn, &5)
-            .unwrap()
-            .unwrap()
-            .to_vec();
+        let mut row = index.mutable_blocks.get(&txn, &5).unwrap().unwrap().to_vec();
         let payload_hash = row.windows(32).rposition(|w| w == hash(5)).unwrap();
         row[payload_hash] ^= 1;
         index.mutable_blocks.put(&mut txn, &5, &row).unwrap();
@@ -1134,17 +839,11 @@ mod tests {
         // Add a transaction without shielded data to a row. The row still decodes, but
         // `CompactBlockRecord::encode` does not accept it, so the seal must not accept it.
         let mut txn = index.env.write_txn().unwrap();
-        let row = index
-            .mutable_blocks
-            .get(&txn, &5)
-            .unwrap()
-            .unwrap()
-            .to_vec();
+        let row = index.mutable_blocks.get(&txn, &5).unwrap().unwrap().to_vec();
         let mut block = ProtobufBlockRecord::decode(&row).unwrap().0;
-        block.vtx.push(ztreamer_protocol::proto::CompactTx {
-            txid: vec![7; 32],
-            ..Default::default()
-        });
+        block
+            .vtx
+            .push(ztreamer_protocol::proto::CompactTx { txid: vec![7; 32], ..Default::default() });
         let payload = block.encode_to_vec();
         let envelope = 1 + size_of::<u32>() + 2 * size_of::<Digest>();
         let mut damaged = row[..envelope].to_vec();
@@ -1185,23 +884,13 @@ mod tests {
         let mut builder = OrderedBuilder::new(IndexState::default(), 10 * 1024 * 1024).unwrap();
         builder.push(prepared(0)).unwrap();
 
-        assert!(
-            builder
-                .build_batch(None, None, 10 * 1024 * 1024)
-                .unwrap()
-                .is_none()
-        );
+        assert!(builder.build_batch(None, None, 10 * 1024 * 1024).unwrap().is_none());
         let txn = index.env.read_txn().unwrap();
         assert!(index.mutable_blocks.get(&txn, &0).unwrap().is_none());
         drop(txn);
 
         let state = index
-            .write(
-                builder
-                    .build_batch(Some(0), None, 10 * 1024 * 1024)
-                    .unwrap()
-                    .unwrap(),
-            )
+            .write(builder.build_batch(Some(0), None, 10 * 1024 * 1024).unwrap().unwrap())
             .unwrap();
         let txn = index.env.read_txn().unwrap();
         assert!(index.mutable_blocks.get(&txn, &0).unwrap().is_some());
@@ -1212,12 +901,7 @@ mod tests {
             builder.push(prepared(height)).unwrap();
         }
         let state = index
-            .write(
-                builder
-                    .build_batch(Some(90), Some(0), 10 * 1024 * 1024)
-                    .unwrap()
-                    .unwrap(),
-            )
+            .write(builder.build_batch(Some(90), Some(0), 10 * 1024 * 1024).unwrap().unwrap())
             .unwrap();
         let txn = index.env.read_txn().unwrap();
         assert!(index.mutable_blocks.get(&txn, &0).unwrap().is_some());
@@ -1229,12 +913,7 @@ mod tests {
             builder.push(prepared(height)).unwrap();
         }
         let state = index
-            .write(
-                builder
-                    .build_batch(Some(1_089), Some(999), 10 * 1024 * 1024)
-                    .unwrap()
-                    .unwrap(),
-            )
+            .write(builder.build_batch(Some(1_089), Some(999), 10 * 1024 * 1024).unwrap().unwrap())
             .unwrap();
         let txn = index.env.read_txn().unwrap();
         assert_eq!(state.sealed_through(), Some(999));
@@ -1259,10 +938,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let encoded = crate::codec::encode_range(&records).unwrap();
-        index
-            .sealed_ranges
-            .put(&mut txn, &0, encoded.as_slice())
-            .unwrap();
+        index.sealed_ranges.put(&mut txn, &0, encoded.as_slice()).unwrap();
         for height in 0..RANGE_SIZE / 2 {
             index.mutable_blocks.delete(&mut txn, &height).unwrap();
         }
@@ -1283,16 +959,9 @@ mod tests {
         let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         let state = index.write(batch(&index, 0..=1_005, 1_100)).unwrap();
 
+        assert_eq!(index.read_block(state.generation(), 537).unwrap().height, 537);
         assert_eq!(
-            index.read_block(state.generation(), 537).unwrap().height,
-            537
-        );
-        assert_eq!(
-            index
-                .read_block_by_hash(state.generation(), hash(1_002))
-                .unwrap()
-                .unwrap()
-                .height,
+            index.read_block_by_hash(state.generation(), hash(1_002)).unwrap().unwrap().height,
             1_002
         );
 
@@ -1377,16 +1046,8 @@ mod tests {
 
         assert_eq!(state.durable_tip(), Some(BlockId::new(55, branch_hash(55))));
         assert_eq!(pinned_hashes, [hash(29), hash(30), hash(31), hash(32)]);
-        assert!(
-            index
-                .read_block_by_hash(state.generation(), hash(31))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            index.read_block(state.generation(), 31).unwrap().hash,
-            branch_hash(31)
-        );
+        assert!(index.read_block_by_hash(state.generation(), hash(31)).unwrap().is_none());
+        assert_eq!(index.read_block(state.generation(), 31).unwrap().hash, branch_hash(31));
         index.verify_continuity().unwrap();
     }
 
@@ -1413,25 +1074,13 @@ mod tests {
                 record
             })
             .collect();
-        let state = index
-            .replace_deep_suffix(old.generation(), common, replacement, Some(1_010))
-            .unwrap();
+        let state =
+            index.replace_deep_suffix(old.generation(), common, replacement, Some(1_010)).unwrap();
 
         assert_eq!(state.sealed_through(), Some(999));
-        assert_eq!(
-            index.read_block(state.generation(), 950).unwrap().hash,
-            hash(950)
-        );
-        assert_eq!(
-            index.read_block(state.generation(), 951).unwrap().hash,
-            branch_hash(951)
-        );
-        assert!(
-            index
-                .read_block_by_hash(state.generation(), hash(951))
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(index.read_block(state.generation(), 950).unwrap().hash, hash(950));
+        assert_eq!(index.read_block(state.generation(), 951).unwrap().hash, branch_hash(951));
+        assert!(index.read_block_by_hash(state.generation(), hash(951)).unwrap().is_none());
         index.verify_continuity().unwrap();
     }
 
@@ -1448,25 +1097,6 @@ mod tests {
             )
             .unwrap()
             .unwrap()
-    }
-
-    fn prepared(height: u32) -> ParsedCompactBlock {
-        ParsedCompactBlock {
-            height,
-            hash: hash(height),
-            previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
-            time: height,
-            transactions: Vec::new(),
-            sapling_additions: 0,
-            orchard_additions: 0,
-            ironwood_additions: 0,
-        }
-    }
-
-    fn hash(height: u32) -> Digest {
-        let mut hash = [0; 32];
-        hash[..4].copy_from_slice(&height.to_be_bytes());
-        hash
     }
 
     fn branch_hash(height: u32) -> Digest {

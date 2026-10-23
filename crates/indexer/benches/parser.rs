@@ -11,7 +11,7 @@ use zakura_test::vectors::{
     BLOCK_MAINNET_949496_BYTES, BLOCK_MAINNET_1687106_BYTES, BLOCK_MAINNET_1687121_BYTES,
     BLOCK_TESTNET_1842421_BYTES,
 };
-use ztreamer_indexer::parser::{RawIndexBlock, parse_block};
+use ztreamer_indexer::{parser::parse_block, types::RawIndexBlock};
 
 fn corpus() -> Vec<(&'static str, RawIndexBlock)> {
     let mut corpus: Vec<_> = [
@@ -31,11 +31,7 @@ fn corpus() -> Vec<(&'static str, RawIndexBlock)> {
             height: block.coinbase_height().unwrap(),
             hash: block.hash(),
             bytes,
-            txids: block
-                .transactions
-                .iter()
-                .map(|transaction| transaction.hash())
-                .collect(),
+            txids: block.transactions.iter().map(|transaction| transaction.hash()).collect(),
         };
         (name, raw)
     })
@@ -44,9 +40,7 @@ fn corpus() -> Vec<(&'static str, RawIndexBlock)> {
     for (name, count) in [("synthetic-64-tx", 64), ("synthetic-1024-tx", 1024)] {
         let mut block = Block::zcash_deserialize(BLOCK_MAINNET_1687121_BYTES.as_slice()).unwrap();
         let transaction = block.transactions.last().unwrap().clone();
-        block
-            .transactions
-            .extend(std::iter::repeat_n(transaction, count));
+        block.transactions.extend(std::iter::repeat_n(transaction, count));
         corpus.push((
             name,
             RawIndexBlock {

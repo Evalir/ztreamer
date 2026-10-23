@@ -6,10 +6,10 @@ use crate::{
     Digest,
     codec::{CodecError, CompactBlockRecord, MAX_RECORD_BYTES, TreeSizes},
     index::{IndexState, RANGE_SIZE},
-    parser::ParsedCompactBlock,
+    types::ParsedCompactBlock,
 };
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum IngestError {
     #[error(transparent)]
     Codec(#[from] CodecError),
@@ -55,8 +55,25 @@ pub struct OrderedBuilder {
     max_pending_bytes: usize,
 }
 
+impl std::fmt::Debug for OrderedBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrderedBuilder")
+            .field("next_height", &self.next_height)
+            .field("previous_hash", &self.previous_hash)
+            .field("tree_sizes", &self.tree_sizes)
+            .field("generation", &self.generation)
+            .field("pending", &self.pending.len())
+            .field("pending_bytes", &self.pending_bytes)
+            .field("ready_end", &self.ready_end)
+            .field("ready_bytes", &self.ready_bytes)
+            .field("max_pending_bytes", &self.max_pending_bytes)
+            .finish()
+    }
+}
+
 /// An ordered batch produced by [`OrderedBuilder::build_batch`] for appending
 /// to the [`crate::index::Index`].
+#[derive(Debug)]
 pub struct WriteBatch {
     /// Index generation the batch was built against.
     pub(crate) base_generation: u64,
@@ -87,11 +104,8 @@ impl WriteBatch {
     /// Encodes all records on a maximum of `threads` scoped threads. The result keeps the
     /// encoded bytes and the identity of each block, but not the decoded transactions.
     pub(crate) fn encode(self, threads: usize) -> Result<EncodedBatch, CodecError> {
-        let end_tree_sizes = self
-            .records
-            .last()
-            .expect("builders never emit empty batches")
-            .end_tree_sizes;
+        let end_tree_sizes =
+            self.records.last().expect("builders never emit empty batches").end_tree_sizes;
         let encode = |records: &[CompactBlockRecord]| {
             records
                 .iter()
@@ -173,19 +187,12 @@ impl OrderedBuilder {
     /// Hands a block over to queue inclusion in a [`WriteBatch`]
     pub fn push(&mut self, block: ParsedCompactBlock) -> Result<(), IngestError> {
         if block.height < self.next_height || self.pending.contains_key(&block.height) {
-            return Err(IngestError::DuplicateHeight {
-                height: block.height,
-            });
+            return Err(IngestError::DuplicateHeight { height: block.height });
         }
         let bytes = CompactBlockRecord::encoded_size_bound(&block.transactions)?;
-        let pending_bytes = self
-            .pending_bytes
-            .checked_add(bytes)
-            .ok_or(IngestError::Overflow)?;
+        let pending_bytes = self.pending_bytes.checked_add(bytes).ok_or(IngestError::Overflow)?;
         if pending_bytes > self.max_pending_bytes {
-            return Err(IngestError::PendingBytes {
-                limit: self.max_pending_bytes,
-            });
+            return Err(IngestError::PendingBytes { limit: self.max_pending_bytes });
         }
         self.pending_bytes = pending_bytes;
         let height = block.height;
@@ -194,10 +201,8 @@ impl OrderedBuilder {
             while let Ok(height) = self.ready_end.try_into()
                 && let Some((_, bytes)) = self.pending.get(&height)
             {
-                self.ready_bytes = self
-                    .ready_bytes
-                    .checked_add(*bytes)
-                    .ok_or(IngestError::Overflow)?;
+                self.ready_bytes =
+                    self.ready_bytes.checked_add(*bytes).ok_or(IngestError::Overflow)?;
                 self.ready_end += 1;
             }
         }
@@ -205,16 +210,16 @@ impl OrderedBuilder {
     }
 
     /// Encoded-size estimate, including the contiguous ready prefix.
-    pub(crate) fn pending_bytes(&self) -> usize {
+    pub(crate) const fn pending_bytes(&self) -> usize {
         self.pending_bytes
     }
 
     /// First height not yet in the contiguous prefix; may equal target + 1.
-    pub(crate) fn first_missing_height(&self) -> u64 {
+    pub(crate) const fn first_missing_height(&self) -> u64 {
         self.ready_end
     }
 
-    pub(crate) fn ready_bytes(&self) -> usize {
+    pub(crate) const fn ready_bytes(&self) -> usize {
         self.ready_bytes
     }
 
@@ -244,15 +249,9 @@ impl OrderedBuilder {
             if durable_through.is_none_or(|height| block.height > height) {
                 break;
             }
-            if batch_bytes
-                .checked_add(*bytes)
-                .ok_or(IngestError::Overflow)?
-                > max_batch_bytes
-            {
+            if batch_bytes.checked_add(*bytes).ok_or(IngestError::Overflow)? > max_batch_bytes {
                 if records.is_empty() {
-                    return Err(IngestError::BatchBytes {
-                        limit: max_batch_bytes,
-                    });
+                    return Err(IngestError::BatchBytes { limit: max_batch_bytes });
                 }
                 let range_end = block
                     .height
@@ -264,45 +263,29 @@ impl OrderedBuilder {
                     break;
                 }
             }
-            if self
-                .previous_hash
-                .is_some_and(|previous| block.previous_hash != previous)
-            {
-                return Err(IngestError::Parent {
-                    height: block.height,
-                });
+            if self.previous_hash.is_some_and(|previous| block.previous_hash != previous) {
+                return Err(IngestError::Parent { height: block.height });
             }
             let end_tree_sizes = TreeSizes {
                 sapling: self
                     .tree_sizes
                     .sapling
                     .checked_add(block.sapling_additions)
-                    .ok_or(IngestError::TreeSize {
-                        height: block.height,
-                    })?,
+                    .ok_or(IngestError::TreeSize { height: block.height })?,
                 orchard: self
                     .tree_sizes
                     .orchard
                     .checked_add(block.orchard_additions)
-                    .ok_or(IngestError::TreeSize {
-                        height: block.height,
-                    })?,
+                    .ok_or(IngestError::TreeSize { height: block.height })?,
                 ironwood: self
                     .tree_sizes
                     .ironwood
                     .checked_add(block.ironwood_additions)
-                    .ok_or(IngestError::TreeSize {
-                        height: block.height,
-                    })?,
+                    .ok_or(IngestError::TreeSize { height: block.height })?,
             };
-            let next_height = self
-                .next_height
-                .checked_add(1)
-                .ok_or(IngestError::Overflow)?;
-            let (block, bytes) = self
-                .pending
-                .remove(&self.next_height)
-                .expect("the pending block was just checked");
+            let next_height = self.next_height.checked_add(1).ok_or(IngestError::Overflow)?;
+            let (block, bytes) =
+                self.pending.remove(&self.next_height).expect("the pending block was just checked");
 
             batch_bytes += bytes;
             self.pending_bytes -= bytes;
@@ -323,22 +306,16 @@ impl OrderedBuilder {
         if records.is_empty() {
             return Ok(None);
         }
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or(IngestError::Overflow)?;
-        Ok(Some(WriteBatch {
-            base_generation,
-            seal_through,
-            records,
-        }))
+        self.generation = self.generation.checked_add(1).ok_or(IngestError::Overflow)?;
+        Ok(Some(WriteBatch { base_generation, seal_through, records }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{CompactSaplingOutput, CompactTransaction};
+    use crate::test_utils::prepared;
+    use crate::types::{CompactSaplingOutput, CompactTransaction};
 
     #[test]
     fn reassembles_out_of_order_blocks_and_assigns_tree_sizes() {
@@ -359,17 +336,9 @@ mod tests {
         let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
 
         builder.push(prepared(1)).unwrap();
-        assert!(
-            builder
-                .build_batch(Some(1), None, 1_000_000)
-                .unwrap()
-                .is_none()
-        );
+        assert!(builder.build_batch(Some(1), None, 1_000_000).unwrap().is_none());
         builder.push(first).unwrap();
-        let batch = builder
-            .build_batch(Some(1), None, 1_000_000)
-            .unwrap()
-            .unwrap();
+        let batch = builder.build_batch(Some(1), None, 1_000_000).unwrap().unwrap();
         assert_eq!(batch.records.len(), 2);
         assert_eq!(batch.records[0].height, 0);
         assert_eq!(batch.records[1].height, 1);
@@ -387,10 +356,7 @@ mod tests {
 
         builder.push(prepared(0)).unwrap();
         assert_eq!(builder.ready_bytes(), 3 * bytes);
-        let batch = builder
-            .build_batch(Some(2), None, 2 * bytes)
-            .unwrap()
-            .unwrap();
+        let batch = builder.build_batch(Some(2), None, 2 * bytes).unwrap().unwrap();
         assert_eq!(batch.records.len(), 2);
         assert_eq!(builder.ready_bytes(), bytes);
     }
@@ -434,10 +400,7 @@ mod tests {
             });
             builder.push(block).unwrap();
         }
-        let batch = builder
-            .build_batch(Some(99), None, 10_000_000)
-            .unwrap()
-            .unwrap();
+        let batch = builder.build_batch(Some(99), None, 10_000_000).unwrap().unwrap();
         let expected: Vec<_> = batch
             .records
             .iter()
@@ -455,24 +418,5 @@ mod tests {
             assert_eq!(actual, expected);
             assert_eq!(encoded.end_tree_sizes, end_tree_sizes);
         }
-    }
-
-    fn prepared(height: u32) -> ParsedCompactBlock {
-        ParsedCompactBlock {
-            height,
-            hash: hash(height),
-            previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
-            time: height,
-            transactions: Vec::new(),
-            sapling_additions: 0,
-            orchard_additions: 0,
-            ironwood_additions: 0,
-        }
-    }
-
-    fn hash(height: u32) -> Digest {
-        let mut hash = [0; 32];
-        hash[..4].copy_from_slice(&height.to_be_bytes());
-        hash
     }
 }

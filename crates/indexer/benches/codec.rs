@@ -1,17 +1,16 @@
 // Disabled due to warnings in criterion macros
 #![allow(missing_docs)]
 
-#[path = "../../../benchmarks/fixtures.rs"]
-mod fixtures;
+use ztreamer_indexer::test_utils::{self as fixtures, hash};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use zakura_chain::{block::Block, serialization::ZcashDeserialize as _};
 use zakura_test::vectors::BLOCK_MAINNET_1687121_BYTES;
 use ztreamer_indexer::{
-    Digest,
     codec::{CompactBlockRecord, TreeSizes, decode_range_record, encode_range},
     index::RANGE_SIZE,
-    parser::{CompactTransaction, RawIndexBlock, parse_block},
+    parser::parse_block,
+    types::{CompactTransaction, RawIndexBlock},
 };
 
 fn shielded_transactions() -> Vec<CompactTransaction> {
@@ -21,20 +20,10 @@ fn shielded_transactions() -> Vec<CompactTransaction> {
         height: block.coinbase_height().unwrap(),
         hash: block.hash(),
         bytes,
-        txids: block
-            .transactions
-            .iter()
-            .map(|transaction| transaction.hash())
-            .collect(),
+        txids: block.transactions.iter().map(|transaction| transaction.hash()).collect(),
     })
     .unwrap()
     .transactions
-}
-
-fn hash(height: u32) -> Digest {
-    let mut hash = [0; 32];
-    hash[..4].copy_from_slice(&height.to_be_bytes());
-    hash
 }
 
 fn record(height: u32, transactions: Vec<CompactTransaction>) -> CompactBlockRecord {
@@ -77,9 +66,8 @@ fn block_codec(c: &mut Criterion) {
 
 fn range_codec(c: &mut Criterion) {
     let transactions = shielded_transactions();
-    let records = (0..RANGE_SIZE)
-        .map(|height| record(height, transactions.clone()))
-        .collect::<Vec<_>>();
+    let records =
+        (0..RANGE_SIZE).map(|height| record(height, transactions.clone())).collect::<Vec<_>>();
     let encoded = encode_range(&records).unwrap();
 
     let mut group = c.benchmark_group("encode_range");
@@ -98,10 +86,7 @@ fn mixed_range_codec(c: &mut Criterion) {
     let records = fixtures::mixed_records(RANGE_SIZE);
     let encoded = encode_range(&records).unwrap();
     for index in [0, 500, 999] {
-        assert_eq!(
-            decode_range_record(&encoded, index).unwrap(),
-            records[index]
-        );
+        assert_eq!(decode_range_record(&encoded, index).unwrap(), records[index]);
     }
     let mut group = c.benchmark_group("range_codec_mixed_v1");
     group.throughput(Throughput::Bytes(encoded.len() as u64));

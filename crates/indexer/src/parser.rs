@@ -1,10 +1,14 @@
 //! Selective parser for the wallet-scanning fields in Zcash transaction versions 1–6.
 
-use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
-use zakura_chain::{block, transaction};
+use zakura_chain::transaction;
 
-use crate::{Ciphertext, Digest, EphemeralKey};
+use crate::{
+    Digest,
+    types::{
+        CompactSaplingOutput, CompactShieldedAction, CompactTransaction, ParsedCompactBlock,
+        RawIndexBlock,
+    },
+};
 
 const MAX_TRANSACTION_BYTES: usize = 2_000_000;
 const MAX_VECTOR_ITEMS: usize = u16::MAX as usize;
@@ -25,43 +29,8 @@ const ORCHARD_ACTION_BYTES: usize = 820;
 const BCTV14_JOINSPLIT_BYTES: usize = 1_802;
 const GROTH16_JOINSPLIT_BYTES: usize = 1_698;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RawIndexBlock {
-    pub height: block::Height,
-    pub hash: block::Hash,
-    pub bytes: Vec<u8>,
-    pub txids: Vec<transaction::Hash>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CompactSaplingOutput {
-    pub cmu: Digest,
-    pub ephemeral_key: EphemeralKey,
-    #[serde(with = "BigArray")]
-    pub ciphertext: Ciphertext,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CompactShieldedAction {
-    pub nullifier: Digest,
-    pub commitment: Digest,
-    pub ephemeral_key: EphemeralKey,
-    #[serde(with = "BigArray")]
-    pub ciphertext: Ciphertext,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CompactTransaction {
-    pub index: u64,
-    pub txid: Digest,
-    pub sapling_spends: Vec<Digest>,
-    pub sapling_outputs: Vec<CompactSaplingOutput>,
-    pub orchard_actions: Vec<CompactShieldedAction>,
-    pub ironwood_actions: Vec<CompactShieldedAction>,
-}
-
 impl CompactTransaction {
-    fn has_payload(&self) -> bool {
+    const fn has_payload(&self) -> bool {
         !self.sapling_spends.is_empty()
             || !self.sapling_outputs.is_empty()
             || !self.orchard_actions.is_empty()
@@ -69,21 +38,7 @@ impl CompactTransaction {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Parser output that later gets converted into a
-/// [`crate::codec::CompactBlockRecord`]
-pub struct ParsedCompactBlock {
-    pub height: u32,
-    pub hash: Digest,
-    pub previous_hash: Digest,
-    pub time: u32,
-    pub transactions: Vec<CompactTransaction>,
-    pub sapling_additions: u32,
-    pub orchard_additions: u32,
-    pub ironwood_additions: u32,
-}
-
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum CompactParseError {
     #[error("block {height} has a truncated header")]
     TruncatedHeader { height: u32 },
@@ -94,11 +49,7 @@ pub enum CompactParseError {
         source: TransactionParseError,
     },
     #[error("block {height} contains {transactions} transactions but Zakura supplied {txids} IDs")]
-    TransactionCount {
-        height: u32,
-        transactions: usize,
-        txids: usize,
-    },
+    TransactionCount { height: u32, transactions: usize, txids: usize },
     #[error("block {height} transaction {index}: {source}")]
     Transaction {
         height: u32,
@@ -110,7 +61,7 @@ pub enum CompactParseError {
     CommitmentCount { height: u32 },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum TransactionParseError {
     #[error("transaction is larger than {MAX_TRANSACTION_BYTES} bytes")]
     TooLarge,
@@ -131,15 +82,11 @@ pub enum TransactionParseError {
 pub fn parse_block(block: &RawIndexBlock) -> Result<ParsedCompactBlock, CompactParseError> {
     let height = block.height.0;
     let mut reader = Reader::new(&block.bytes);
-    reader
-        .skip(HEADER_PREFIX_BYTES)
-        .map_err(|_| CompactParseError::TruncatedHeader { height })?;
+    reader.skip(HEADER_PREFIX_BYTES).map_err(|_| CompactParseError::TruncatedHeader { height })?;
     let solution_bytes = reader
         .compact_size(MAX_EQUIHASH_SOLUTION_BYTES)
         .map_err(|source| CompactParseError::Framing { height, source })?;
-    reader
-        .skip(solution_bytes)
-        .map_err(|_| CompactParseError::TruncatedHeader { height })?;
+    reader.skip(solution_bytes).map_err(|_| CompactParseError::TruncatedHeader { height })?;
     let transaction_count = reader
         .compact_size(MAX_VECTOR_ITEMS)
         .map_err(|source| CompactParseError::Framing { height, source })?;
@@ -169,14 +116,8 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<ParsedCompactBlock, CompactP
     let mut ironwood_additions = 0usize;
     for (index, txid) in block.txids.iter().enumerate() {
         let start = reader.offset;
-        let compact =
-            parse_transaction_from(&mut reader, *txid, index as u64).map_err(|source| {
-                CompactParseError::Transaction {
-                    height,
-                    index,
-                    source,
-                }
-            })?;
+        let compact = parse_transaction_from(&mut reader, *txid, index as u64)
+            .map_err(|source| CompactParseError::Transaction { height, index, source })?;
         if reader.offset - start > MAX_TRANSACTION_BYTES {
             return Err(CompactParseError::Transaction {
                 height,
@@ -197,9 +138,7 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<ParsedCompactBlock, CompactP
             transactions.push(compact);
         }
     }
-    reader
-        .finish()
-        .map_err(|source| CompactParseError::Framing { height, source })?;
+    reader.finish().map_err(|source| CompactParseError::Framing { height, source })?;
 
     Ok(ParsedCompactBlock {
         height,
@@ -231,13 +170,8 @@ pub(crate) fn parse_stored_block<'a>(
     let mut orchard_additions = 0usize;
     let mut ironwood_additions = 0usize;
     for (index, (bytes, txid)) in transactions.into_iter().enumerate() {
-        let transaction = parse_transaction(bytes, txid, index as u64).map_err(|source| {
-            CompactParseError::Transaction {
-                height,
-                index,
-                source,
-            }
-        })?;
+        let transaction = parse_transaction(bytes, txid, index as u64)
+            .map_err(|source| CompactParseError::Transaction { height, index, source })?;
         sapling_additions = sapling_additions
             .checked_add(transaction.sapling_outputs.len())
             .ok_or(CompactParseError::CommitmentCount { height })?;
@@ -350,7 +284,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
@@ -358,15 +292,11 @@ impl<'a> Reader<'a> {
         let end = self
             .offset
             .checked_add(len)
-            .ok_or(TransactionParseError::LengthLimit {
-                offset: self.offset,
-            })?;
+            .ok_or(TransactionParseError::LengthLimit { offset: self.offset })?;
         let bytes = self
             .bytes
             .get(self.offset..end)
-            .ok_or(TransactionParseError::Truncated {
-                offset: self.offset,
-            })?;
+            .ok_or(TransactionParseError::Truncated { offset: self.offset })?;
         self.offset = end;
         Ok(bytes)
     }
@@ -424,22 +354,16 @@ impl<'a> Reader<'a> {
     fn skip_items(&mut self, count: usize, size: usize) -> Result<(), TransactionParseError> {
         let bytes = count
             .checked_mul(size)
-            .ok_or(TransactionParseError::LengthLimit {
-                offset: self.offset,
-            })?;
+            .ok_or(TransactionParseError::LengthLimit { offset: self.offset })?;
         self.skip(bytes)
     }
 
     fn ensure_items(&self, count: usize, size: usize) -> Result<(), TransactionParseError> {
         let bytes = count
             .checked_mul(size)
-            .ok_or(TransactionParseError::LengthLimit {
-                offset: self.offset,
-            })?;
+            .ok_or(TransactionParseError::LengthLimit { offset: self.offset })?;
         if bytes > self.bytes.len() - self.offset {
-            return Err(TransactionParseError::Truncated {
-                offset: self.offset,
-            });
+            return Err(TransactionParseError::Truncated { offset: self.offset });
         }
         Ok(())
     }
@@ -547,11 +471,7 @@ impl<'a> Reader<'a> {
         if includes_proof {
             self.skip(SAPLING_V4_OUTPUT_BYTES - SAPLING_OUTPUT_PREFIX_BYTES)?;
         }
-        Ok(CompactSaplingOutput {
-            cmu,
-            ephemeral_key,
-            ciphertext,
-        })
+        Ok(CompactSaplingOutput { cmu, ephemeral_key, ciphertext })
     }
 
     fn actions(&mut self) -> Result<Vec<CompactShieldedAction>, TransactionParseError> {
@@ -584,13 +504,11 @@ impl<'a> Reader<'a> {
         Ok(actions)
     }
 
-    fn finish(&self) -> Result<(), TransactionParseError> {
+    const fn finish(&self) -> Result<(), TransactionParseError> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
-            Err(TransactionParseError::TrailingBytes {
-                offset: self.offset,
-            })
+            Err(TransactionParseError::TrailingBytes { offset: self.offset })
         }
     }
 }
@@ -626,11 +544,7 @@ mod tests {
                 height,
                 hash: block.hash(),
                 bytes,
-                txids: block
-                    .transactions
-                    .iter()
-                    .map(|transaction| transaction.hash())
-                    .collect(),
+                txids: block.transactions.iter().map(|transaction| transaction.hash()).collect(),
             })
             .unwrap();
             let transaction_bytes = block
@@ -692,10 +606,7 @@ mod tests {
         };
         let bytes = transaction.zcash_serialize_to_vec().unwrap();
         let parsed = Transaction::zcash_deserialize(bytes.as_slice()).unwrap();
-        assert_eq!(
-            parse_transaction(&bytes, parsed.hash(), 0).unwrap(),
-            reference(&parsed, 0)
-        );
+        assert_eq!(parse_transaction(&bytes, parsed.hash(), 0).unwrap(), reference(&parsed, 0));
     }
 
     #[test]
@@ -709,10 +620,8 @@ mod tests {
     }
 
     fn reference(transaction: &Transaction, index: u64) -> CompactTransaction {
-        let sapling_spends = transaction
-            .sapling_spends_per_anchor()
-            .map(|spend| spend.nullifier.into())
-            .collect();
+        let sapling_spends =
+            transaction.sapling_spends_per_anchor().map(|spend| spend.nullifier.into()).collect();
         let sapling_outputs = transaction
             .sapling_outputs()
             .map(|output| {

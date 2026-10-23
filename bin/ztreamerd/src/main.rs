@@ -1,8 +1,11 @@
 //! `ztreamerd` process lifecycle: embedded Zakura, historical indexing, head following, and servers.
 
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+
 use std::{
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -11,8 +14,8 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use eyre::{Result, WrapErr, eyre};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -20,7 +23,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use zakurad::{components::metrics::MetricsEndpoint, config::ZakuradConfig};
 use ztreamer_indexer::{
-    head::HeadSyncError, index::Index, pipeline::PipelineConfig, source::ZakuraSource,
+    head::HeadSyncError,
+    index::{Index, IndexState},
+    pipeline::PipelineConfig,
+    source::ZakuraSource,
 };
 use ztreamer_node as node;
 use ztreamer_protocol::wire::compact_tx_streamer_server::CompactTxStreamerServer;
@@ -90,6 +96,26 @@ struct Cli {
     index_only: bool,
 }
 
+impl From<&Cli> for PipelineConfig {
+    /// Starts from the pipeline defaults and applies the limits given on the command line.
+    fn from(cli: &Cli) -> Self {
+        let defaults = Self::default();
+        Self {
+            workers: cli.workers.map_or(defaults.workers, NonZeroUsize::get),
+            source_segment_blocks: cli
+                .source_segment_blocks
+                .map_or(defaults.source_segment_blocks, NonZeroU32::get),
+            max_pending_bytes: cli
+                .max_pending_bytes
+                .map_or(defaults.max_pending_bytes, NonZeroUsize::get),
+            max_batch_bytes: cli
+                .max_batch_bytes
+                .map_or(defaults.max_batch_bytes, NonZeroUsize::get),
+            ..defaults
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -103,9 +129,9 @@ async fn main() -> Result<()> {
     let grpc_server = grpc_server(cli.tls_cert.as_deref(), cli.tls_key.as_deref())?;
 
     let mut config =
-        ZakuradConfig::load(cli.zakura_config.clone()).context("load Zakura configuration")?;
+        ZakuradConfig::load(cli.zakura_config.clone()).wrap_err("load Zakura configuration")?;
     config.metrics.endpoint_addr = Some(cli.metrics_listen);
-    let _metrics = MetricsEndpoint::new(&config.metrics).context("start Prometheus endpoint")?;
+    let _metrics = MetricsEndpoint::new(&config.metrics).wrap_err("start Prometheus endpoint")?;
     let network = config.network.network.clone();
     let index = Arc::new(Index::open(
         &cli.index_dir,
@@ -127,13 +153,13 @@ async fn main() -> Result<()> {
             ready_tx,
         ))
         .await
-        .map_err(|error| anyhow!("Zakura failed: {error}"))
+        .map_err(|error| eyre!("Zakura failed: {error}"))
     };
     let application = async {
         let services = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Ok(()),
-            result = ready_rx => result.context("Zakura stopped before readiness")?,
+            result = ready_rx => result.wrap_err("Zakura stopped before readiness")?,
         };
         run_application(
             cli,
@@ -147,56 +173,78 @@ async fn main() -> Result<()> {
         .await
     };
 
-    lifecycle::supervise(
-        node,
-        application,
-        shutdown.clone(),
-        lifecycle::shutdown_signal(),
-    )
-    .await
+    lifecycle::supervise(node, application, shutdown.clone(), lifecycle::shutdown_signal()).await
 }
 
 async fn run_application(
     cli: Cli,
-    mut grpc_server: Server,
+    grpc_server: Server,
     index: Arc<Index>,
     chain_name: String,
     p2p: Arc<P2pCompactService>,
     client: node::NodeClient,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    if wait_for_node(&client, &shutdown).await?.is_break() {
+        return Ok(());
+    }
+
+    let pipeline = PipelineConfig::from(&cli);
+    let ControlFlow::Continue(state) =
+        sync_historical(&client, &index, pipeline, cli.index_only, &shutdown).await?
+    else {
+        return Ok(());
+    };
+    if cli.index_only || shutdown.is_cancelled() {
+        return Ok(());
+    }
+
+    let compact = CompactService::with_node(index, state, chain_name, client.clone())
+        .with_ping_enabled(cli.ping_very_insecure);
+    if reconcile_head(&compact, client.clone(), pipeline, &shutdown).await?.is_break() {
+        return Ok(());
+    }
+    p2p.install(compact.clone()).map_err(|error| eyre!(error))?;
+    drop(p2p);
+
+    serve(compact, client, pipeline, grpc_server, &cli, &shutdown).await
+}
+
+/// Waits until Zakura is near the chain tip and has a finalized block. Breaks on shutdown.
+async fn wait_for_node(
+    client: &node::NodeClient,
+    shutdown: &CancellationToken,
+) -> Result<ControlFlow<()>> {
     info!("waiting for Zakura to sync near the chain tip");
     tokio::select! {
         result = client.wait_until_close_to_tip() => {
-            result.map_err(|error| anyhow!("wait for Zakura sync: {error}"))?;
+            result.map_err(|error| eyre!("wait for Zakura sync: {error}"))?;
         }
-        _ = shutdown.cancelled() => return Ok(()),
+        _ = shutdown.cancelled() => return Ok(ControlFlow::Break(())),
     }
     info!(tip = ?client.tip(), "Zakura is near the chain tip");
 
     while client.database().tip().is_none() {
         info!("waiting for Zakura's first finalized block");
         tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
+            _ = shutdown.cancelled() => return Ok(ControlFlow::Break(())),
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
     }
+    Ok(ControlFlow::Continue(()))
+}
 
-    let mut pipeline = PipelineConfig::default();
-    if let Some(workers) = cli.workers {
-        pipeline.workers = workers.get();
-    }
-    if let Some(source_segment_blocks) = cli.source_segment_blocks {
-        pipeline.source_segment_blocks = source_segment_blocks.get();
-    }
-    if let Some(max_pending_bytes) = cli.max_pending_bytes {
-        pipeline.max_pending_bytes = max_pending_bytes.get();
-    }
-    if let Some(max_batch_bytes) = cli.max_batch_bytes {
-        pipeline.max_batch_bytes = max_batch_bytes.get();
-    }
+/// Runs the historical index pass. Breaks if shutdown stopped the pass, which is an error
+/// with `index_only` because the index was the whole job.
+async fn sync_historical(
+    client: &node::NodeClient,
+    index: &Arc<Index>,
+    pipeline: PipelineConfig,
+    index_only: bool,
+    shutdown: &CancellationToken,
+) -> Result<ControlFlow<(), IndexState>> {
     let source = ZakuraSource::new(client.database());
-    let sync_index = Arc::clone(&index);
+    let sync_index = Arc::clone(index);
     info!("syncing historical compact index");
     let historical_started = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
@@ -205,22 +253,22 @@ async fn run_application(
         move || source.sync(&sync_index, pipeline, &stop)
     });
     let state = tokio::select! {
-        result = &mut historical => result.context("historical index task panicked")??,
+        result = &mut historical => result.wrap_err("historical index task panicked")??,
         _ = shutdown.cancelled() => {
             info!("stopping the historical index pass before shutdown");
             stop.store(true, Ordering::Relaxed);
-            let state = historical.await.context("historical index task panicked")??;
+            let state = historical.await.wrap_err("historical index task panicked")??;
             info!(
                 height = state.durable_tip().map(|tip| tip.height),
                 elapsed_seconds = historical_started.elapsed().as_secs_f64(),
                 "historical compact index stopped before shutdown"
             );
-            if cli.index_only {
-                return Err(anyhow!(
+            if index_only {
+                return Err(eyre!(
                     "historical compact index stopped by shutdown before it completed"
                 ));
             }
-            return Ok(());
+            return Ok(ControlFlow::Break(()));
         }
     };
     info!(
@@ -228,33 +276,41 @@ async fn run_application(
         elapsed_seconds = historical_started.elapsed().as_secs_f64(),
         "historical compact index complete"
     );
+    Ok(ControlFlow::Continue(state))
+}
 
-    if cli.index_only || shutdown.is_cancelled() {
-        return Ok(());
-    }
-
-    let compact = CompactService::with_node(index, state, chain_name, client.clone())
-        .with_ping_enabled(cli.ping_very_insecure);
-    let mut startup_client = client.clone();
+/// Brings the compact index onto Zakura's canonical head, recovering a deep reorg if needed.
+/// Breaks on shutdown.
+async fn reconcile_head(
+    compact: &CompactService,
+    mut client: node::NodeClient,
+    pipeline: PipelineConfig,
+    shutdown: &CancellationToken,
+) -> Result<ControlFlow<()>> {
     let reconcile = async {
-        match compact.sync_head(&mut startup_client, pipeline).await {
+        match compact.sync_head(&mut client, pipeline).await {
             Err(HeadSyncError::DeepReorg { .. }) => {
-                compact
-                    .recover_deep_reorg(&mut startup_client, pipeline)
-                    .await
+                compact.recover_deep_reorg(&mut client, pipeline).await
             }
             result => result,
         }
-        .context("reconcile compact index with Zakura's canonical head")
+        .wrap_err("reconcile compact index with Zakura's canonical head")
     };
     tokio::select! {
-        _ = shutdown.cancelled() => return Ok(()),
-        result = reconcile => { result?; }
+        _ = shutdown.cancelled() => Ok(ControlFlow::Break(())),
+        result = reconcile => result.map(|_| ControlFlow::Continue(())),
     }
-    p2p.install(compact.clone())
-        .map_err(|error| anyhow!(error))?;
-    drop(p2p);
+}
 
+/// Runs the head follower and gRPC server until shutdown or until either task stops.
+async fn serve(
+    compact: CompactService,
+    client: node::NodeClient,
+    pipeline: PipelineConfig,
+    mut grpc_server: Server,
+    cli: &Cli,
+    shutdown: &CancellationToken,
+) -> Result<()> {
     let (server_shutdown, _) = watch::channel(false);
     let mut follower = tokio::spawn({
         let compact = compact.clone();
@@ -263,22 +319,20 @@ async fn run_application(
             compact
                 .follow_head(client, pipeline, HeadFollowerConfig::default(), receiver)
                 .await
-                .context("head follower failed")
+                .wrap_err("head follower failed")
         }
     });
     let mut grpc = tokio::spawn({
         let receiver = server_shutdown.subscribe();
+        let address = cli.grpc_listen;
+        let tls = cli.tls_cert.is_some();
         async move {
-            info!(
-                address = %cli.grpc_listen,
-                tls = cli.tls_cert.is_some(),
-                "serving CompactTxStreamer gRPC"
-            );
+            info!(%address, tls, "serving CompactTxStreamer gRPC");
             grpc_server
                 .add_service(CompactTxStreamerServer::new(compact))
-                .serve_with_shutdown(cli.grpc_listen, shutdown_requested(receiver))
+                .serve_with_shutdown(address, shutdown_requested(receiver))
                 .await
-                .context("gRPC server failed")
+                .wrap_err("gRPC server failed")
         }
     });
 
@@ -293,24 +347,12 @@ async fn run_application(
     let _ = server_shutdown.send(true);
 
     // Drain both tasks before inspecting either result, including on failure.
-    let (grpc_result, follower_result) = tokio::join!(
-        async {
-            match grpc_result {
-                Some(result) => result,
-                None => grpc.await,
-            }
-        },
-        async {
-            match follower_result {
-                Some(result) => result,
-                None => follower.await,
-            }
-        },
-    );
+    let (grpc_result, follower_result) =
+        lifecycle::drain_both((grpc, grpc_result), (follower, follower_result)).await;
     task_result(grpc_result, "gRPC")?;
     task_result(follower_result, "head follower")?;
     if task_exited {
-        return Err(anyhow!("daemon task stopped unexpectedly"));
+        return Err(eyre!("daemon task stopped unexpectedly"));
     }
     Ok(())
 }
@@ -319,20 +361,18 @@ fn grpc_server(tls_cert: Option<&Path>, tls_key: Option<&Path>) -> Result<Server
     let server = Server::builder();
     let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) else {
         if tls_cert.is_some() || tls_key.is_some() {
-            return Err(anyhow!(
-                "--tls-cert and --tls-key must be provided together"
-            ));
+            return Err(eyre!("--tls-cert and --tls-key must be provided together"));
         }
         return Ok(server);
     };
 
     let cert = std::fs::read(cert_path)
-        .with_context(|| format!("read TLS certificate {}", cert_path.display()))?;
+        .wrap_err_with(|| format!("read TLS certificate {}", cert_path.display()))?;
     let key = std::fs::read(key_path)
-        .with_context(|| format!("read TLS private key {}", key_path.display()))?;
+        .wrap_err_with(|| format!("read TLS private key {}", key_path.display()))?;
     server
         .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
-        .context("configure gRPC TLS")
+        .wrap_err("configure gRPC TLS")
 }
 
 async fn shutdown_requested(mut receiver: watch::Receiver<bool>) {
@@ -340,5 +380,23 @@ async fn shutdown_requested(mut receiver: watch::Receiver<bool>) {
 }
 
 fn task_result(result: Result<Result<()>, tokio::task::JoinError>, name: &str) -> Result<()> {
-    result.with_context(|| format!("{name} task panicked"))?
+    result.wrap_err_with(|| format!("{name} task panicked"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_config_keeps_defaults_for_unset_flags() {
+        let cli =
+            Cli::parse_from(["ztreamerd", "--fetch-workers", "3", "--max-batch-bytes", "4096"]);
+        let defaults = PipelineConfig::default();
+        let pipeline = PipelineConfig::from(&cli);
+        assert_eq!(pipeline.workers, 3);
+        assert_eq!(pipeline.max_batch_bytes, 4096);
+        assert_eq!(pipeline.source_segment_blocks, defaults.source_segment_blocks);
+        assert_eq!(pipeline.max_pending_bytes, defaults.max_pending_bytes);
+        assert_eq!(pipeline.max_source_bytes, defaults.max_source_bytes);
+    }
 }

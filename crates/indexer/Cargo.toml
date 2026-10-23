@@ -1,29 +1,39 @@
 [package]
 name = "ztreamer-indexer"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Shared test and benchmark fixtures in `ztreamer_indexer::test_utils`.
+test-utils = ["dep:zakura-test"]
 
 [dependencies]
 heed = { version = "0.22.1", default-features = false }
-hex = "0.4"
 metrics = "0.24"
 prost = "0.14.4"
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tonic = "0.14.6"
 tracing = "0.1"
 zakura-chain.workspace = true
 zakura-state = { workspace = true, features = ["indexer"] }
+zakura-test = { workspace = true, optional = true }
 ztreamer-node = { path = "../node" }
 ztreamer-protocol = { path = "../protocol" }
 
 [dev-dependencies]
-criterion = "0.7"
-metrics-util = { version = "0.19.1", default-features = false, features = ["debugging"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+criterion = "0.8"
+metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 tempfile = "3"
 zakura-test.workspace = true
+# Enables `test_utils` for this crate's benches.
+ztreamer-indexer = { path = ".", features = ["test-utils"] }
 
 [[bench]]
 name = "parser"

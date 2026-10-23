@@ -1,7 +1,6 @@
 #![allow(missing_docs)]
 
-#[path = "../../../benchmarks/fixtures.rs"]
-mod fixtures;
+use ztreamer_indexer::test_utils as fixtures;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ztreamer_indexer::{
@@ -26,10 +25,7 @@ fn builder(c: &mut Criterion) {
                     if reversed {
                         parsed.reverse();
                     }
-                    (
-                        OrderedBuilder::new(IndexState::default(), 256 * 1024 * 1024).unwrap(),
-                        parsed,
-                    )
+                    (OrderedBuilder::new(IndexState::default(), 256 * 1024 * 1024).unwrap(), parsed)
                 },
                 |(builder, parsed)| {
                     for block in parsed.drain(..) {
@@ -129,9 +125,7 @@ fn storage(c: &mut Criterion) {
     let index = open(&dir);
     fixtures::populate(&index, &records, Some(1_999));
     drop(index);
-    c.bench_function("restart_mixed_v1/2200-blocks-warm", |b| {
-        b.iter(|| open(&dir))
-    });
+    c.bench_function("restart_mixed_v1/2200-blocks-warm", |b| b.iter(|| open(&dir)));
 }
 
 criterion_group! { name = benches; config = Criterion::default().noise_threshold(0.05).sample_size(20); targets = builder, storage }

@@ -1,11 +1,16 @@
 [package]
 name = "ztreamer-node"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-color-eyre = { version = "0.6", default-features = false }
-tower = { version = "0.4.13", features = ["buffer", "util"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tower = { version = "0.5.3", features = ["buffer", "util"] }
 zakura-chain.workspace = true
 zakura-node-services.workspace = true
 zakura-state = { workspace = true, features = ["indexer"] }

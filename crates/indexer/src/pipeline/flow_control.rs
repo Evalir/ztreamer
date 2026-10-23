@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{codec::CompactBlockRecord, ingest::IngestError, parser::ParsedCompactBlock};
+use crate::{codec::CompactBlockRecord, ingest::IngestError, types::ParsedCompactBlock};
 
 use super::PipelineError;
 
@@ -37,13 +37,7 @@ pub(crate) fn channel(
         changed: Condvar::new(),
         read_ahead_limit,
     });
-    (
-        ReadAheadSender {
-            tx,
-            budget: Arc::clone(&budget),
-        },
-        ReadAheadReceiver { rx, budget },
-    )
+    (ReadAheadSender { tx, budget: Arc::clone(&budget) }, ReadAheadReceiver { rx, budget })
 }
 
 /// The read-ahead budget that the senders and the receiver share. The condition variable wakes
@@ -70,9 +64,7 @@ struct BudgetState {
 
 impl ReadAheadBudget {
     fn lock(&self) -> MutexGuard<'_, BudgetState> {
-        self.state
-            .lock()
-            .expect("read-ahead budget lock is not poisoned")
+        self.state.lock().expect("read-ahead budget lock is not poisoned")
     }
 
     /// Waits until `bytes` fit in the limit, then reserves them. The block at
@@ -132,11 +124,7 @@ impl ReadAheadSender {
     /// Starts a segment. The worker must send each height from `start` to `end`, in ascending
     /// order, and then call [`SegmentSender::finish`].
     pub(crate) fn segment(&mut self, start: u32, end: u32) -> SegmentSender<'_> {
-        SegmentSender {
-            sender: self,
-            next_height: u64::from(start),
-            end_height: u64::from(end),
-        }
+        SegmentSender { sender: self, next_height: u64::from(start), end_height: u64::from(end) }
     }
 
     /// Stops all senders that wait. Use this when a worker fails.
@@ -192,7 +180,7 @@ impl SegmentSender<'_> {
     }
 
     /// Ends the segment. The result is an error if the worker did not send all its heights.
-    pub(crate) fn finish(self) -> Result<(), PipelineError> {
+    pub(crate) const fn finish(self) -> Result<(), PipelineError> {
         if self.next_height <= self.end_height {
             return Err(PipelineError::SourceGap {
                 expected: self.next_height as u32,
