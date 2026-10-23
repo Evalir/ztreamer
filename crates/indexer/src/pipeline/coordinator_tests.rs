@@ -208,6 +208,32 @@ fn sequential_parallel_and_skewed_ingestion_match_and_reopen() {
     }
 }
 
+/// The public entry point repeats passes until the tip holds still, and a stop ends it early.
+#[test]
+fn sync_historical_repeats_until_the_tip_holds_still_or_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let source = Fixture::new(1_107);
+    let stop = AtomicBool::new(false);
+    let state = sync_historical(&index, &source, config(2), &stop).unwrap();
+    assert_eq!(state.durable_tip().map(|tip| tip.height), Some(1_106));
+    verify(&index, source.count);
+
+    // Nothing new: one more pass that changes nothing, same state back.
+    let again = sync_historical(&index, &source, config(2), &stop).unwrap();
+    assert_eq!(again, state);
+
+    // A stop set during the pass ends it below the tip and returns what was written.
+    let dir = tempfile::tempdir().unwrap();
+    let index = open(&dir, 32 * MIB);
+    let mut source = Fixture::new(1_107);
+    source.stop_at = Some(300);
+    let state = sync_historical(&index, &source, config(1), &source.stop).unwrap();
+    let tip = state.durable_tip().map(|tip| tip.height).unwrap();
+    assert!((300..1_106).contains(&tip), "stopped pass ends below the tip, got {tip}");
+    index.verify_continuity().unwrap();
+}
+
 /// A channel limit of a few blocks (4 KiB). Workers must wait for the block at `next_height`.
 /// `pending` is then above the channel limit, so the coordinator writes a batch after each
 /// push.
