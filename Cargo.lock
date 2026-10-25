@@ -8037,6 +8037,7 @@ dependencies = [
 name = "ztreamer-service"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "criterion",
  "hdrhistogram",
@@ -8051,6 +8052,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower 0.5.3",
+ "tracing",
  "zakura",
  "zakura-chain",
  "zakura-network",
