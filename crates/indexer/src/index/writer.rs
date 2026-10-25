@@ -9,6 +9,7 @@ use heed::{Env, RwTxn};
 
 use super::{
     BlockId, IndexError, IndexState, RANGE_SIZE,
+    range_meta::{RangeMeta, VerifyState},
     tables::Tables,
     telemetry::{WriteStage, WriteTimer, record_state_metrics},
 };
@@ -22,7 +23,7 @@ pub(crate) type BatchRows = Peekable<std::vec::IntoIter<EncodedBlock>>;
 
 /// An open write transaction and the [`IndexState`] it will commit.
 ///
-/// Rows change through one of two sets of methods:
+/// Rows change through one of three sets of methods:
 ///
 /// - Reorgs use [`IndexWriter::put_block`] and [`IndexWriter::delete_block`], which always
 ///   change a block row and its hash entry together. In one transaction, do all deletes before the
@@ -30,6 +31,8 @@ pub(crate) type BatchRows = Peekable<std::vec::IntoIter<EncodedBlock>>;
 ///   ancestor, so a delete after a put can delete a canonical hash.
 /// - Appends use [`IndexWriter::put_hashes`] for the whole batch first, then seal and append
 ///   the rows. A batch row that goes into a sealed range is never written as a mutable row.
+/// - Installs use [`IndexWriter::put_new_hashes`] for the blocks of one packed range, then
+///   [`IndexWriter::put_sealed_range`]. An install writes no mutable row.
 ///
 /// Dropping a writer without [`IndexWriter::commit`] aborts the transaction.
 pub(crate) struct IndexWriter<'env> {
@@ -46,11 +49,17 @@ impl<'env> IndexWriter<'env> {
         tables: Tables,
         base_generation: u64,
     ) -> Result<Self, IndexError> {
-        let txn = env.write_txn()?;
-        let state = tables.metadata.get_state(&txn)?;
-        if state.generation != base_generation {
+        let writer = Self::start_latest(env, tables)?;
+        if writer.state.generation != base_generation {
             return Err(IndexError::StaleBatch { batch_generation: base_generation });
         }
+        Ok(writer)
+    }
+
+    /// Starts a write transaction on the current generation. The caller must check the state.
+    pub(crate) fn start_latest(env: &'env Env, tables: Tables) -> Result<Self, IndexError> {
+        let txn = env.write_txn()?;
+        let state = tables.metadata.get_state(&txn)?;
         Ok(Self { txn, tables, state, timer: None })
     }
 
@@ -95,6 +104,17 @@ impl<'env> IndexWriter<'env> {
         self.delete_block(&old)
     }
 
+    /// Writes the hash entry of each block in an installed range. Refuses a hash that the index
+    /// holds already, also a hash that occurs two times in `blocks`.
+    pub(crate) fn put_new_hashes(&mut self, blocks: &[BlockId]) -> Result<(), IndexError> {
+        blocks.iter().try_for_each(|block| {
+            if self.tables.hash_to_height.get(&self.txn, &block.hash)?.is_some() {
+                return Err(IndexError::DuplicateHash { height: block.height });
+            }
+            self.tables.hash_to_height.put(&mut self.txn, &block.hash, block.height)
+        })
+    }
+
     /// Writes the hash entry of every block in an appended batch.
     pub(crate) fn put_hashes(&mut self, blocks: &[EncodedBlock]) -> Result<(), IndexError> {
         blocks.iter().try_for_each(|block| {
@@ -136,6 +156,27 @@ impl<'env> IndexWriter<'env> {
         Ok(())
     }
 
+    /// Writes a packed range from a snapshot and its metadata. Moves `sealed_through` to the
+    /// range end. A [`VerifyState::Verified`] range advances `verified_through` if the old value
+    /// is `start - 1`. The caller must check that `start` is [`IndexState::next_range_start`].
+    pub(crate) fn put_sealed_range(
+        &mut self,
+        start: u32,
+        packed: &[u8],
+        meta: &RangeMeta,
+    ) -> Result<(), IndexError> {
+        self.tables.sealed_ranges.put(&mut self.txn, start, packed)?;
+        self.tables.range_meta.put(&mut self.txn, start, meta)?;
+        let end = meta.entry.end_height;
+        if meta.state == VerifyState::Verified
+            && self.state.verified_through == start.checked_sub(1)
+        {
+            self.state.verified_through = Some(end);
+        }
+        self.state.sealed_through = Some(end);
+        Ok(())
+    }
+
     /// Seals each range that ends at or below both `seal_through` and the tip. Call it after
     /// [`IndexWriter::set_tip`]. A range takes its mutable rows first, then rows from `blocks`;
     /// a reorg passes no `blocks`, so its ranges must be complete in the mutable rows.
@@ -147,10 +188,7 @@ impl<'env> IndexWriter<'env> {
         let Some(seal_through) = seal_through else {
             return Ok(());
         };
-        let mut start = self
-            .state
-            .sealed_through
-            .map_or(Ok(0), |height| height.checked_add(1).ok_or(IndexError::Overflow))?;
+        let mut start = self.state.next_range_start()?;
 
         loop {
             let end = start.checked_add(RANGE_SIZE - 1).ok_or(IndexError::Overflow)?;
