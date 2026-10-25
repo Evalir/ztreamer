@@ -8024,6 +8024,7 @@ dependencies = [
  "tokio",
  "tracing",
  "webpki-roots",
+ "ztreamer-remote",
 ]
 
 [[package]]
