@@ -39,6 +39,7 @@ use ztreamer_service::{
 };
 
 mod lifecycle;
+mod remote;
 
 /// Must be large enough to hold full mainnet index, which is 21 GiB at the time of writing
 const DEFAULT_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024;
@@ -110,6 +111,23 @@ struct Cli {
     /// replica, with the TLS settings of the CompactTxStreamer server. Off when not set.
     #[arg(long, value_name = "ADDR")]
     replicate_listen: Option<SocketAddr>,
+
+    #[command(flatten)]
+    remote: remote::RemoteArgs,
+}
+
+impl Cli {
+    /// Opens the index of `--index-dir` on a blocking thread and refuses an index of another
+    /// network.
+    async fn open_index(&self, network: &Network) -> Result<Arc<Index>> {
+        let (path, map_size) = (self.index_dir.clone(), self.index_map_size.get());
+        let (name, genesis_hash) = (network.to_string(), network.genesis_hash());
+        let index =
+            tokio::task::spawn_blocking(move || Index::open(path, map_size, &name, genesis_hash))
+                .await
+                .wrap_err("index open task panicked")??;
+        Ok(Arc::new(index))
+    }
 }
 
 impl From<&Cli> for PipelineConfig {
@@ -143,18 +161,16 @@ async fn main() -> Result<()> {
 
     // Read and validate the identity before starting the node or the potentially lengthy index.
     let grpc_server = grpc_server(cli.tls_cert.as_deref(), cli.tls_key.as_deref())?;
+    if let Some(node) = cli.remote.node()? {
+        return node.run(cli, grpc_server, lifecycle::shutdown_signal()).await;
+    }
 
     let mut config =
         ZakuradConfig::load(cli.zakura_config.clone()).wrap_err("load Zakura configuration")?;
     config.metrics.endpoint_addr = Some(cli.metrics_listen);
     let _metrics = MetricsEndpoint::new(&config.metrics).wrap_err("start Prometheus endpoint")?;
     let network = config.network.network.clone();
-    let index = Arc::new(Index::open(
-        &cli.index_dir,
-        cli.index_map_size.get(),
-        &network.to_string(),
-        network.genesis_hash(),
-    )?);
+    let index = cli.open_index(&network).await?;
 
     let p2p = Arc::new(P2pCompactService::pending());
     info!(network = %network, "starting embedded Zakura");
@@ -183,8 +199,8 @@ async fn main() -> Result<()> {
             head: client.clone(),
             backend: InProcessBackend::with_node(client),
         };
-        run_application(cli, grpc_server, index, &network, p2p.clone(), sources, shutdown.clone())
-            .await
+        let p2p = Some(p2p.clone());
+        run_application(cli, grpc_server, index, &network, p2p, sources, shutdown.clone()).await
     };
 
     lifecycle::supervise(node, application, shutdown.clone(), lifecycle::shutdown_signal()).await
@@ -230,12 +246,14 @@ impl<T, B> Readiness for NodeSources<T, node::NodeClient, B> {
     }
 }
 
+/// Indexes, then serves until shutdown. `p2p` gets the compact service when a node runs in this
+/// process.
 async fn run_application<T, H, B>(
     cli: Cli,
     grpc_server: Server,
     index: Arc<Index>,
     network: &Network,
-    p2p: Arc<P2pCompactService>,
+    p2p: Option<Arc<P2pCompactService>>,
     sources: NodeSources<T, H, B>,
     shutdown: CancellationToken,
 ) -> Result<()>
@@ -267,8 +285,9 @@ where
     if reconcile_head(&compact, head.clone(), pipeline, &shutdown).await?.is_break() {
         return Ok(());
     }
-    p2p.install(compact.clone()).map_err(|error| eyre!(error))?;
-    drop(p2p);
+    if let Some(p2p) = p2p {
+        p2p.install(compact.clone()).map_err(|error| eyre!(error))?;
+    }
 
     let extras = Extras {
         filler: filler_index.map(|index| {
