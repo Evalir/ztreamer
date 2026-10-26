@@ -176,7 +176,7 @@ pub struct EpochProof {
 }
 
 /// The three note commitment trees during a rebuild.
-struct Trees {
+pub(crate) struct Trees {
     sapling: sapling::tree::NoteCommitmentTree,
     orchard: orchard::tree::NoteCommitmentTree,
     ironwood: ironwood::tree::NoteCommitmentTree,
@@ -244,7 +244,7 @@ impl Trees {
 
     /// The roots of the trees. A root is `None` when the frontier of its pool is empty, because
     /// the node gives no root for a pool that is not active.
-    fn roots(&self, frontiers: &Frontiers) -> PoolRoots {
+    pub(crate) fn roots(&self, frontiers: &Frontiers) -> PoolRoots {
         PoolRoots {
             sapling: (!frontiers.sapling.is_empty()).then(|| self.sapling.root()),
             orchard: (!frontiers.orchard.is_empty()).then(|| self.orchard.root()),

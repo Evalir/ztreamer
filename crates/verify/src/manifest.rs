@@ -312,12 +312,52 @@ struct TreeSizesJson {
 }
 
 /// A note commitment pool.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Pool {
+pub enum Pool {
+    /// The Sapling pool.
     Sapling,
+    /// The Orchard pool.
     Orchard,
+    /// The Ironwood pool.
     Ironwood,
+}
+
+impl Pool {
+    /// The three pools.
+    pub const ALL: [Self; 3] = [Self::Sapling, Self::Orchard, Self::Ironwood];
+
+    /// The name of the pool in the manifest and in `z_getsubtreesbyindex`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sapling => "sapling",
+            Self::Orchard => "orchard",
+            Self::Ironwood => "ironwood",
+        }
+    }
+
+    /// Reads a subtree root of this pool from `bytes` in the byte order of the pool, as
+    /// `z_getsubtreesbyindex` prints it. Returns `None` when the bytes are not a node of the pool.
+    pub fn subtree_node(self, bytes: [u8; 32]) -> Option<SubtreeNode> {
+        match self {
+            Self::Sapling => {
+                Option::from(sapling_crypto::Node::from_bytes(bytes)).map(SubtreeNode::Sapling)
+            }
+            Self::Orchard => orchard::tree::Node::try_from(bytes).ok().map(SubtreeNode::Orchard),
+            Self::Ironwood => ironwood::tree::Node::try_from(bytes).ok().map(SubtreeNode::Ironwood),
+        }
+    }
+}
+
+impl From<&SubtreeNode> for Pool {
+    /// The pool of a subtree root.
+    fn from(node: &SubtreeNode) -> Self {
+        match node {
+            SubtreeNode::Sapling(_) => Self::Sapling,
+            SubtreeNode::Orchard(_) => Self::Orchard,
+            SubtreeNode::Ironwood(_) => Self::Ironwood,
+        }
+    }
 }
 
 /// The JSON form of a [`SubtreeRoot`].
@@ -415,15 +455,9 @@ impl TryFrom<SubtreeRootJson> for SubtreeRoot {
 
     fn try_from(json: SubtreeRootJson) -> Result<Self, Self::Error> {
         let SubtreeRootJson { pool, index, root } = json;
-        match pool {
-            Pool::Sapling => {
-                Option::from(sapling_crypto::Node::from_bytes(root)).map(SubtreeNode::Sapling)
-            }
-            Pool::Orchard => orchard::tree::Node::try_from(root).ok().map(SubtreeNode::Orchard),
-            Pool::Ironwood => ironwood::tree::Node::try_from(root).ok().map(SubtreeNode::Ironwood),
-        }
-        .map(|root| Self { index: NoteCommitmentSubtreeIndex(index), root })
-        .ok_or(InvalidSubtreeRoot { pool, index })
+        pool.subtree_node(root)
+            .map(|root| Self { index: NoteCommitmentSubtreeIndex(index), root })
+            .ok_or(InvalidSubtreeRoot { pool, index })
     }
 }
 
