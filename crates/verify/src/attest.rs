@@ -20,8 +20,11 @@ use zakura_chain::{block, subtree::NoteCommitmentSubtreeIndex};
 use zakura_rpc::client::Commitments;
 use zakura_state::HashOrHeight;
 use ztreamer_indexer::{
+    codec::CodecError,
     frontier::{FromRpc, RpcDecodeError},
     index::range_meta::{Attested, PoolRoots, SubtreeNode},
+    parser::CompactParseError,
+    types::RawBlockError,
 };
 use ztreamer_remote::{RpcError, ZakuraClient};
 
@@ -80,9 +83,19 @@ pub enum NodeError {
         /// The index of the subtree.
         index: NoteCommitmentSubtreeIndex,
     },
+    /// The node block does not deserialize, or has no coinbase height.
+    #[error(transparent)]
+    RawBlock(#[from] RawBlockError),
+    /// The indexer parser does not read the node block.
+    #[error(transparent)]
+    Parse(#[from] CompactParseError),
+    /// The record of the node block does not encode.
+    #[error("record of the node block does not encode")]
+    Encode(#[from] CodecError),
 }
 
-/// Why [`Epoch::attest`] did not attest an epoch.
+/// Why [`Epoch::attest`] or [`Epoch::sample`](crate::epoch::Epoch::sample) did not accept an
+/// epoch.
 #[derive(Debug, thiserror::Error)]
 pub enum EpochError {
     /// A range of the epoch is wrong, or a blob must be fetched again.
