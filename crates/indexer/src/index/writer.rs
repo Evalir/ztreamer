@@ -189,22 +189,30 @@ impl<'env> IndexWriter<'env> {
         self.extend_verified_prefix()
     }
 
-    /// Moves `verified_through` over each range after the verified prefix that has a
-    /// [`VerifyState::Verified`] row. It stops at the first range with no row or with another
-    /// state. Thus a range that was verified before the ranges below it joins the prefix when
-    /// they are verified.
+    /// Moves `verified_through` over each sealed range after the verified prefix that has a
+    /// [`VerifyState::Verified`] row, or no row. It stops at the first range with another state,
+    /// or after `sealed_through`. Thus a range that was verified or sealed before the ranges below
+    /// it joins the prefix when they are verified.
+    ///
+    /// A sealed range with no row came from node blocks: an install always writes a row, and a
+    /// deep reorg deletes the rows of the ranges that it rebuilds. A replica trusts its source
+    /// node as much as its verified snapshot (see
+    /// [`IndexWriter::join_sealed_range_to_verified_prefix`]). If `verified_through` is not set,
+    /// a range with no row does not start a prefix. Thus the embedded mode never sets it.
     fn extend_verified_prefix(&mut self) -> Result<(), IndexError> {
         loop {
             let start = self.state.next_verify_start()?;
-            let Some(row) = self
-                .tables
-                .range_meta
-                .get(&self.txn, start)?
-                .filter(|row| row.state == VerifyState::Verified)
-            else {
+            if self.state.sealed_through.is_none_or(|sealed| start > sealed) {
                 return Ok(());
+            }
+            let end = match self.tables.range_meta.get(&self.txn, start)? {
+                Some(row) if row.state == VerifyState::Verified => row.entry.end_height,
+                None if self.state.verified_through.is_some() => {
+                    start.checked_add(RANGE_SIZE - 1).ok_or(IndexError::Overflow)?
+                }
+                _ => return Ok(()),
             };
-            self.state.verified_through = Some(row.entry.end_height);
+            self.state.verified_through = Some(end);
         }
     }
 
@@ -261,7 +269,19 @@ impl<'env> IndexWriter<'env> {
             timer.bytes(WriteStage::SealPut, packed.len());
         });
         self.state.sealed_through = Some(end);
+        self.join_sealed_range_to_verified_prefix(start, end);
         Ok(())
+    }
+
+    /// Moves `verified_through` to `end` if the range `start..=end`, which the index sealed from
+    /// node blocks, starts directly after the verified prefix. A replica trusts its source node
+    /// as much as its verified snapshot. Thus a range that it seals from the tail or the head
+    /// follower joins the prefix. An index with no `verified_through`, as in the embedded mode,
+    /// keeps it unset.
+    fn join_sealed_range_to_verified_prefix(&mut self, start: u32, end: u32) {
+        if self.state.verified_through.and_then(|through| through.checked_add(1)) == Some(start) {
+            self.state.verified_through = Some(end);
+        }
     }
 
     /// Advances the generation, writes the state, and commits. This is the only path that
