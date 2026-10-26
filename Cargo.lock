@@ -8077,6 +8077,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "criterion",
+ "ed25519-dalek",
  "hex",
  "incrementalmerkletree",
  "rand 0.9.5",
@@ -8099,8 +8100,12 @@ dependencies = [
 name = "ztreamerd"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "chrono",
  "clap",
+ "ed25519-dalek",
  "eyre",
+ "hex",
  "http",
  "serde_json",
  "tempfile",
@@ -8115,9 +8120,11 @@ dependencies = [
  "zakura-rpc",
  "zakura-state",
  "zakura-test",
+ "zeroize",
  "ztreamer-indexer",
  "ztreamer-node",
  "ztreamer-protocol",
  "ztreamer-remote",
  "ztreamer-service",
+ "ztreamer-verify",
 ]

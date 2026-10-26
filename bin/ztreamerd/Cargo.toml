@@ -8,9 +8,14 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+blake3.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek.workspace = true
 eyre = "0.6"
+hex = "0.4"
 http = "1"
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 tracing = "0.1"
@@ -18,9 +23,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zakura-chain.workspace = true
 zakura-rpc.workspace = true
 zakurad = { workspace = true, features = ["indexer", "prometheus"] }
+zeroize = "1"
 ztreamer-indexer = { path = "../../crates/indexer" }
 ztreamer-protocol = { path = "../../crates/protocol" }
 ztreamer-service = { path = "../../crates/service" }
+ztreamer-verify = { path = "../../crates/verify" }
 ztreamer-node = { path = "../../crates/node" }
 ztreamer-remote = { path = "../../crates/remote" }
 tokio-util = "0.7"
