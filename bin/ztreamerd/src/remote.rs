@@ -19,7 +19,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::{info, warn};
-use zakura_chain::parameters::Network;
+use zakura_chain::{block::Height, parameters::Network};
 use zakura_rpc::client::GetBlockchainInfoResponse;
 use zakurad::components::metrics::{self, MetricsEndpoint};
 use ztreamer_indexer::{
@@ -377,14 +377,16 @@ impl IndexTip {
     /// the head follower read the blocks above the tip, thus the first of them must be at or
     /// above the prune height of the node.
     fn served_by(self, info: &GetBlockchainInfoResponse) -> Result<bool> {
-        let next = self.0.map_or(0, |tip| tip.height.saturating_add(1));
-        let prune_height = info.first_block_with_body().0;
-        if next < prune_height {
+        let next = Height(self.0.map_or(0, |tip| tip.height.saturating_add(1)));
+        let first = info.first_block_with_body();
+        if next < first {
             return Err(eyre!(
-                "the index needs block {next}, but the remote zakura node keeps block bodies \
-                 only from height {prune_height}: use a node that keeps these blocks, or an \
-                 index with a tip at or above {}",
-                prune_height - 1
+                "the index needs block {}, but the remote zakura node keeps block bodies only \
+                 from height {}: use a node that keeps these blocks, or an index with a tip at \
+                 or above {}",
+                next.0,
+                first.0,
+                first.0 - 1
             ));
         }
         Ok(self.0.is_none_or(|tip| info.blocks().0 >= tip.height))

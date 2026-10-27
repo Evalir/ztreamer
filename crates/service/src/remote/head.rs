@@ -1,5 +1,7 @@
 //! [`CanonicalBlockSource`] over the JSON-RPC interface of a remote zakura node.
 
+use std::panic;
+
 use zakura_chain::block;
 use zakura_state::HashOrHeight;
 use ztreamer_indexer::{
@@ -51,7 +53,7 @@ impl CanonicalBlockSource for RemoteHeadSource {
 
     /// The best-chain block at `height`, or `None` when the node has no block at that height.
     ///
-    /// The hash comes from the block. [`poll_canonical_head`] checks that each block links to
+    /// It decodes the block on the blocking thread pool. The hash comes from the block. [`poll_canonical_head`] checks that each block links to
     /// the block below it. After the reads, it reads the hash of the last block again.
     ///
     /// [`poll_canonical_head`]: ztreamer_indexer::head::poll_canonical_head
@@ -62,7 +64,9 @@ impl CanonicalBlockSource for RemoteHeadSource {
             Err(error) if error.is_block_not_found() => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let block = RawIndexBlock::from_bytes(bytes)
+        let block = tokio::task::spawn_blocking(move || RawIndexBlock::from_bytes(bytes))
+            .await
+            .unwrap_or_else(|error| panic::resume_unwind(error.into_panic()))
             .map_err(|error| HeadError::Decode(error.to_string()))?;
         if block.height.0 != height {
             return Err(HeadError::Height { expected: height, actual: block.height.0 });
@@ -158,9 +162,13 @@ mod tests {
         let blocks = chain(5);
         let chain = MockChain::new(&blocks);
         // This error has the code of the `getblockhash` error above the tip, with another message.
-        let mock = MockNode::start(move |_, request| match request.body["params"][0].as_str() {
-            Some("7") => Reply::Error { code: RpcCode::MISC, message: "Invalid params" },
-            _ => chain.reply(request),
+        let mock = MockNode::start(move |_, request| {
+            match (request.body["method"].as_str(), request.body["params"][0].as_u64()) {
+                (Some("getblockhash"), Some(7)) => {
+                    Reply::Error { code: RpcCode::MISC, message: "Invalid params" }
+                }
+                _ => chain.reply(request),
+            }
         })
         .await;
         let mut source =
@@ -168,7 +176,9 @@ mod tests {
 
         assert!(source.block(5).await.unwrap().is_some());
         assert!(source.block(6).await.unwrap().is_none());
-        assert!(matches!(source.block(7).await, Err(HeadError::Remote(_))));
+        assert_eq!(source.block_hash(5).await.unwrap(), Some(blocks[5].hash()));
+        assert_eq!(source.block_hash(6).await.unwrap(), None);
+        assert!(matches!(source.block_hash(7).await, Err(HeadError::Remote(_))));
     }
 
     #[tokio::test]

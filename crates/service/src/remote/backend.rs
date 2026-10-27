@@ -160,8 +160,9 @@ impl RemoteBackend {
     async fn no_tree_state(&self, hash: block::Hash, error: RpcError) -> BackendError {
         match self.node.get_blockchain_info().await.map(|info| info.first_block_with_body()) {
             Ok(first) if first > block::Height::MIN => BackendError::Unavailable(format!(
-                "remote zakura has no tree state for {hash}: it prunes block bodies below height \
-                 {}, and z_gettreestate reads the block body",
+                "remote zakura has no tree state for {hash}: the block is not in its best chain, \
+                 or it is below height {}, and the node prunes the block bodies below that \
+                 height. z_gettreestate reads the block body",
                 first.0
             )),
             _ => error.into(),

@@ -29,7 +29,11 @@ pub enum HeadError {
     Decode(String),
     #[error("Zakura returned height {actual} for requested height {expected}")]
     Height { expected: u32, actual: u32 },
-    #[error("Zakura canonical block {height} does not connect to its predecessor")]
+    /// The block at `height` does not link to the block below it. The chain of the node changed
+    /// between two reads of the poll. The next poll reads the new chain.
+    #[error(
+        "Zakura block {height} does not link to the block below it: the chain changed during the reads"
+    )]
     Parent { height: u32 },
     #[error("the local anchor at height {height} is not canonical in Zakura")]
     Anchor { height: u32 },

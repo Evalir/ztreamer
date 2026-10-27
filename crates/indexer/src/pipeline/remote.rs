@@ -35,11 +35,12 @@ const REQUESTS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 /// - Run the pipeline on a blocking thread, for example in `tokio::task::spawn_blocking` or on a
 ///   `std::thread`, never in an async task. [`Handle::block_on`] panics in an async context.
 ///
-/// [`HistoricalSource::process_segment`] spawns the `getblock` requests on the runtime, up to 8
-/// ahead of the block that the worker waits for. The requests continue while the worker parses
-/// and sends a block, and while it waits for read-ahead budget. The node thus gets up to
-/// [`PipelineConfig::workers`](super::PipelineConfig::workers) times 8 `getblock` requests at
-/// the same time.
+/// [`HistoricalSource::process_segment`] spawns the `getblock` requests on the runtime. Each
+/// worker keeps a fixed number of requests in flight ahead of the block that it waits for. The
+/// requests continue while the worker parses and sends a block, and while it waits for
+/// read-ahead budget. The node thus gets up to
+/// [`PipelineConfig::workers`](super::PipelineConfig::workers) times that number of `getblock`
+/// requests at the same time.
 ///
 /// ```no_run
 /// use ztreamer_indexer::pipeline::{HistoricalPipeline, PipelineConfig, RemoteTailSource};
