@@ -43,7 +43,7 @@ use zakura_rpc::{
 };
 use zakura_state::{HashOrHeight, MAX_BLOCK_REORG_HEIGHT};
 use ztreamer_indexer::frontier::FromRpc;
-use ztreamer_remote::{RpcCode, RpcError, ZakuraClient};
+use ztreamer_remote::{FirstBlockWithBody as _, RpcError, ZakuraClient};
 
 use crate::backend::{
     AddressUtxo, BackendError, MinedTransaction, StateBackend, Subtrees, TipListener, TreeState,
@@ -237,11 +237,11 @@ impl RemoteBackend {
     /// `z_gettreestate` of zakura reads the block body, also when the node keeps the trees. A
     /// node that prunes thus has no tree state below its prune height. The error says so.
     async fn no_tree_state(&self, hash: block::Hash, error: RpcError) -> BackendError {
-        match self.node.get_blockchain_info().await.map(|info| info.prune_height()) {
-            Ok(Some(prune_height)) => BackendError::Unavailable(format!(
+        match self.node.get_blockchain_info().await.map(|info| info.first_block_with_body()) {
+            Ok(first) if first > block::Height::MIN => BackendError::Unavailable(format!(
                 "remote zakura has no tree state for {hash}: it prunes block bodies below height \
                  {}, and z_gettreestate reads the block body",
-                prune_height.0
+                first.0
             )),
             _ => error.into(),
         }
@@ -253,9 +253,10 @@ impl RemoteBackend {
         &self,
         id: transaction::Hash,
     ) -> Result<Option<FetchedTransaction>, BackendError> {
-        let request = self.node.get_raw_transaction(id, true).await;
-        let Some(response) = request.or_not_found(RpcCode::INVALID_ADDRESS_OR_KEY)? else {
-            return Ok(None);
+        let response = match self.node.get_raw_transaction(id).await {
+            Ok(response) => response,
+            Err(error) if error.is_transaction_not_found() => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         let GetRawTransactionResponse::Object(object) = response else {
             return Err(BackendError::Unexpected(
@@ -503,21 +504,6 @@ impl RpcTree for orchard::tree::NoteCommitmentTree {
 
     fn tree_root(&self) -> Self::Root {
         self.root()
-    }
-}
-
-/// Turns the node's not-found answer into `None`.
-trait OrNotFound<T> {
-    fn or_not_found(self, code: RpcCode) -> Result<Option<T>, BackendError>;
-}
-
-impl<T> OrNotFound<T> for Result<T, RpcError> {
-    fn or_not_found(self, code: RpcCode) -> Result<Option<T>, BackendError> {
-        match self {
-            Ok(value) => Ok(Some(value)),
-            Err(error) if error.rpc_code() == Some(code) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
     }
 }
 
@@ -774,9 +760,10 @@ impl StateBackend for RemoteBackend {
     }
 
     async fn block(&self, hash: block::Hash) -> Result<Option<Arc<Block>>, BackendError> {
-        let request = self.node.get_block_raw(HashOrHeight::Hash(hash)).await;
-        let Some(raw) = request.or_not_found(RpcCode::INVALID_PARAMETER)? else {
-            return Ok(None);
+        let raw = match self.node.get_block_raw(HashOrHeight::Hash(hash)).await {
+            Ok(raw) => raw,
+            Err(error) if error.is_block_not_found() => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         let block = Block::from_node_bytes(raw.0).await?;
         if block.hash() != hash {
@@ -808,7 +795,7 @@ impl StateBackend for RemoteBackend {
         }
         let response = match self.node.z_get_treestate(HashOrHeight::Hash(hash)).await {
             Ok(response) => response,
-            Err(error) if error.rpc_code() == Some(RpcCode::INVALID_PARAMETER) => {
+            Err(error) if error.is_block_not_found() => {
                 return Err(self.no_tree_state(hash, error).await);
             }
             Err(error) => return Err(error.into()),
@@ -994,7 +981,7 @@ mod tests {
     };
     use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
     use ztreamer_remote::{
-        RpcClient,
+        RpcClient, RpcCode,
         test_utils::{MockNode, Reply, Seen},
     };
 

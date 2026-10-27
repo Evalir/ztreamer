@@ -77,9 +77,10 @@
 //! - **`B - SEAL_DEPTH` to `B`.** The head follower reads from [`RemoteHeadSource`], a
 //!   [`CanonicalBlockSource`]. [`CompactService::follow_head`] asks it for the tip with
 //!   `getblockchaininfo`, once for each [`HeadFollowerConfig::poll_interval`], and for each new
-//!   block with `getblockhash` and then `getblock <hash> 0`. Before it reads blocks, it reads
-//!   hashes with `getblockhash` to find the first height that changed, thus one new block costs
-//!   seven requests. The head follower replaces the blocks of a reorg down to [`SEAL_DEPTH`].
+//!   block with one `getblock <height> 0`. Before it reads blocks, it reads hashes with
+//!   `getblockhash` to find the first height that changed, thus one new block costs six requests,
+//!   and each further new block in the same poll one request. The head follower replaces the
+//!   blocks of a reorg down to [`SEAL_DEPTH`].
 //!
 //! With a remote source, the pipeline and the head follower write the same records as with the
 //! embedded node. Thus the index does not know which mode wrote a block.
@@ -127,7 +128,7 @@
 //!   [`RpcCode`]. A block that the node does not have is [`RpcCode::INVALID_PARAMETER`], or
 //!   for `getblockhash` above the tip [`RpcCode::MISC`] with a fixed message (see
 //!   [`RpcError::is_block_not_found`]). A transaction that the node does not have is
-//!   [`RpcCode::INVALID_ADDRESS_OR_KEY`].
+//!   [`RpcCode::INVALID_ADDRESS_OR_KEY`] (see [`RpcError::is_transaction_not_found`]).
 //! - The head follower and the [`TipPoller`] both poll the tip of the node: the first with
 //!   `getblockchaininfo`, the second with `getbestblockhash`. While a mempool stream is open,
 //!   the node thus gets two tip calls per second for the same tip. One shared tip watch could
@@ -146,6 +147,7 @@
 //! [`RpcCode::MISC`]: ztreamer_remote::RpcCode::MISC
 //! [`RpcError::is_block_not_found`]: ztreamer_remote::RpcError::is_block_not_found
 //! [`RpcCode::INVALID_ADDRESS_OR_KEY`]: ztreamer_remote::RpcCode::INVALID_ADDRESS_OR_KEY
+//! [`RpcError::is_transaction_not_found`]: ztreamer_remote::RpcError::is_transaction_not_found
 //! [`RemoteTailSource`]: ztreamer_indexer::pipeline::RemoteTailSource
 //! [`HistoricalSource`]: ztreamer_indexer::pipeline::HistoricalSource
 //! [`CanonicalBlockSource`]: ztreamer_indexer::head::CanonicalBlockSource

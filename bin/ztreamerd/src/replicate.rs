@@ -21,7 +21,7 @@ use tracing::info;
 use zakura_chain::parameters::Network;
 use zakura_rpc::client::GetBlockchainInfoResponse;
 use ztreamer_indexer::index::{Index, range_meta::NodeId};
-use ztreamer_remote::ZakuraClient;
+use ztreamer_remote::{FirstBlockWithBody as _, ZakuraClient};
 use ztreamer_service::RemoteBackend;
 use ztreamer_verify::{
     attest::JsonRpcAttestor,
@@ -150,7 +150,7 @@ impl Replica {
         // The tail, the samples and the tree states of zakura v1.5.1 (zakura-core/zakura#1725)
         // need the blocks from the next block on.
         let next = sealed.map_or(0, |sealed| sealed + 1);
-        let prune_height = info.prune_height().map_or(0, |height| height.0);
+        let prune_height = info.first_block_with_body().0;
         ensure!(
             next >= prune_height,
             "the import needs block {next}, but the remote zakura node keeps block bodies only \
