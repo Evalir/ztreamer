@@ -135,10 +135,10 @@ impl RpcConfig {
 /// The failures that a call retries, up to the retry count of the [`RetryPolicy`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Retries {
-    /// The failures that [`RpcError::is_retryable`] accepts.
+    /// Retries the failures that [`RpcError::is_retryable`] accepts.
     Retryable,
-    /// Only a failure where the request did not reach the node ([`RpcError::is_unsent`]). Use
-    /// this for a call that must not run twice on the node.
+    /// Retries only a failure where the request did not reach the node
+    /// ([`RpcError::is_unsent`]). Use this for a call that must not run twice on the node.
     Unsent,
 }
 
@@ -228,7 +228,7 @@ impl RpcClient {
         self.call_with(method, params, Retries::Retryable).await
     }
 
-    /// [`Self::call`] that retries only the failures in `retries`.
+    /// Calls `method` as [`Self::call`] does, but retries only the failures in `retries`.
     pub(crate) async fn call_with<P, R>(
         &self,
         method: &str,

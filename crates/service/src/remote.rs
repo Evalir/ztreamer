@@ -78,9 +78,9 @@
 //!   [`CanonicalBlockSource`]. [`CompactService::follow_head`] asks it for the tip with
 //!   `getblockchaininfo`, once for each [`HeadFollowerConfig::poll_interval`], and for each new
 //!   block with one `getblock <height> 0`. Before it reads blocks, it reads hashes with
-//!   `getblockhash` to find the first height that changed, thus one new block costs six requests,
-//!   and each further new block in the same poll one request. The head follower replaces the
-//!   blocks of a reorg down to [`SEAL_DEPTH`].
+//!   `getblockhash` to find the first height that changed. Thus one new block costs six
+//!   requests. Each further new block in the same poll costs one request. The head follower
+//!   replaces the blocks of a reorg down to [`SEAL_DEPTH`].
 //!
 //! With a remote source, the pipeline and the head follower write the same records as with the
 //! embedded node. Thus the index does not know which mode wrote a block.

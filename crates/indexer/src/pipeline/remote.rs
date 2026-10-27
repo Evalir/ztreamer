@@ -13,7 +13,7 @@ use ztreamer_remote::{FirstBlockWithBody as _, Method, RpcError, ZakuraClient};
 use super::{HistoricalSource, PipelineError, WorkerStats, flow_control::SegmentSender};
 use crate::{index::SEAL_DEPTH, parser::parse_block, types::RawIndexBlock};
 
-/// The `getblock` requests that one worker keeps in flight.
+/// The number of `getblock` requests that one worker keeps in flight.
 const REQUESTS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 /// The chain of a remote zakura node below the head, read over JSON-RPC.

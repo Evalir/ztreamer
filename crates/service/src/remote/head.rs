@@ -52,7 +52,7 @@ impl CanonicalBlockSource for RemoteHeadSource {
     /// The best-chain block at `height`, or `None` when the node has no block at that height.
     ///
     /// The hash comes from the block. [`poll_canonical_head`] checks that each block links to
-    /// the block below it, and reads the hash of the last block again after the reads.
+    /// the block below it. After the reads, it reads the hash of the last block again.
     ///
     /// [`poll_canonical_head`]: ztreamer_indexer::head::poll_canonical_head
     async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
@@ -157,7 +157,7 @@ mod tests {
     async fn a_height_above_the_tip_of_the_node_is_no_block() {
         let blocks = chain(5);
         let chain = MockChain::new(&blocks);
-        // A different error with the code of the error for a `getblockhash` above the tip.
+        // This error has the code of the `getblockhash` error above the tip, with another message.
         let mock = MockNode::start(move |_, request| match request.body["params"][0].as_str() {
             Some("7") => Reply::Error { code: RpcCode::MISC, message: "Invalid params" },
             _ => chain.reply(request),
@@ -296,9 +296,9 @@ mod tests {
             let before = mock.seen().len();
             service.sync_head(&mut source, PipelineConfig::default()).await.unwrap();
 
-            // One `getblockchaininfo`, one `getblockhash` each for the anchor, the old tip and
-            // the re-check of the new tip, one `getblock` for the height above the new tip, then
-            // one `getblock` for each new block.
+            // The poll sends one `getblockchaininfo` and three `getblockhash`: the anchor, the old
+            // tip and the re-check of the new tip. It sends one `getblock` for each new block and
+            // one `getblock` for the height above the new tip.
             assert_eq!(requests_since(&mock, before), (5 + new, new + 1));
             assert_eq!(visible_tip(&service), Some(id(&blocks[tip as usize])));
         }

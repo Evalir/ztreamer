@@ -256,8 +256,8 @@ struct NodeSources<T, H, B> {
 }
 
 impl<T, B> NodeSources<T, node::NodeClient, B> {
-    /// Waits until the embedded Zakura is near the chain tip and has a finalized block, thus
-    /// ready for the historical index pass. Breaks on shutdown.
+    /// Waits until the embedded Zakura is near the chain tip and has a finalized block. Then the
+    /// node is ready for the historical index pass. Breaks on shutdown.
     ///
     /// The remote mode waits in `RemoteNode::sources`, before it makes its sources.
     async fn wait_ready(&self, shutdown: &CancellationToken) -> Result<ControlFlow<()>> {
