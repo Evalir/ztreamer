@@ -17,18 +17,13 @@ use zakura_chain::{ironwood, orchard, sapling};
 use ztreamer_indexer::{
     codec::{CompactBlockRecord, TreeSizes},
     frontier::{FromRpc, RpcDecodeError},
-    index::range_meta::{Frontiers, ManifestEntry, PoolRoots, SubtreeNode, SubtreeRoot},
+    index::range_meta::{
+        Frontiers, MAX_COMMITMENTS, MAX_RANGES, ManifestEntry, PoolRoots, SubtreeNode, SubtreeRoot,
+    },
     types::CompactShieldedAction,
 };
 
 use crate::range::{Check, RangeBlob, RangeLink, Reject};
-
-/// The most ranges in one epoch.
-pub const MAX_RANGES: usize = 10;
-
-/// An epoch closes at the first range that brings the note commitments it adds, over all three
-/// pools, to this count.
-pub const MAX_COMMITMENTS: u64 = 1_000_000;
 
 /// Consecutive manifest entries that are verified together.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

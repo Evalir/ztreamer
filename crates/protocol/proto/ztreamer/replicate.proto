@@ -7,7 +7,7 @@ syntax = "proto3";
 package ztreamer.replicate;
 
 service Replicator {
-    // The identity of the index and how far it is sealed and verified.
+    // The identity of the index and how far it is sealed.
     rpc GetExportInfo(Empty) returns (ExportInfo);
     // One entry for each sealed range that has range metadata, in ascending height order, from
     // the first range that starts at or above from_start_height.
@@ -23,16 +23,10 @@ message ExportInfo {
     string network = 1;
     // The genesis block hash, 32 bytes in the serialized byte order.
     bytes genesis_hash = 2;
-    // The range blob format versions that the server can send.
-    repeated uint32 range_versions = 3;
     // The version of the ManifestEntry message.
-    uint32 manifest_version = 4;
+    uint32 manifest_version = 3;
     // The highest sealed height. Not set when no range is sealed.
-    optional uint32 sealed_through = 5;
-    // The highest height through which every sealed range is verified. Not set when no range is.
-    optional uint32 verified_through = 6;
-    // The index generation that the answer and the ranges come from.
-    uint64 generation = 7;
+    optional uint32 sealed_through = 4;
 }
 
 message ListRangesRequest {
@@ -45,20 +39,6 @@ enum Pool {
     POOL_SAPLING = 1;
     POOL_ORCHARD = 2;
     POOL_IRONWOOD = 3;
-}
-
-// How far the server has proven a range.
-enum VerifyState {
-    VERIFY_STATE_UNSPECIFIED = 0;
-    // Installed, and no check has run.
-    VERIFY_STATE_UNVERIFIED = 1;
-    // 2 was VERIFY_STATE_CHAIN_OK. It is free for a later use of the same state.
-    reserved 2;
-    reserved "VERIFY_STATE_CHAIN_OK";
-    // The rebuilt tree roots match a node.
-    VERIFY_STATE_VERIFIED = 3;
-    // A check failed.
-    VERIFY_STATE_REJECTED = 4;
 }
 
 // The cumulative note commitment tree sizes after a block.
@@ -85,7 +65,7 @@ message SubtreeRoot {
     bytes root = 3;
 }
 
-// What a snapshot manifest says about one sealed range, and how far the server has proven it.
+// What a snapshot manifest says about one sealed range.
 message ManifestEntry {
     // The range blob format version. At most 255.
     uint32 range_version = 1;
@@ -102,7 +82,6 @@ message ManifestEntry {
     uint64 blob_len = 9;
     // Whether the range closes a verification epoch.
     bool epoch_end = 10;
-    VerifyState state = 11;
 }
 
 message GetRangeRequest {
@@ -113,7 +92,5 @@ message GetRangeRequest {
 }
 
 message RangeChunk {
-    // The position of data in the blob.
-    uint64 offset = 1;
-    bytes data = 2;
+    bytes data = 1;
 }

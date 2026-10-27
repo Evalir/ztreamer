@@ -23,7 +23,7 @@ use ztreamer_indexer::{
     codec::{CompactBlockRecord, RangeDecoder, TreeSizes},
     index::{
         RANGE_SIZE,
-        range_meta::{BlobDigest, ManifestEntry},
+        range_meta::{BlobMismatch, ManifestEntry},
     },
 };
 
@@ -113,6 +113,9 @@ pub enum Reject {
     Refetch {
         /// The first height of the range.
         start_height: u32,
+        /// The value that does not match: the length or the digest.
+        #[source]
+        mismatch: BlobMismatch,
     },
     /// The caller passed a different number of blobs than the epoch has entries.
     #[error("epoch has {entries} entries and {blobs} blobs")]
@@ -145,14 +148,6 @@ impl<'a> RangeBlob<'a> {
         Self { bytes, entry }
     }
 
-    /// Returns `true` if the length and the BLAKE3 digest of the blob are `blob_len` and
-    /// `blob_digest` of the entry: step 1 of the module docs.
-    pub fn matches_digest(&self) -> bool {
-        // Compare the length first: it is free, and the digest reads the whole blob.
-        u64::try_from(self.bytes.len()) == Ok(self.entry.blob_len)
-            && BlobDigest::hash(self.bytes) == self.entry.blob_digest
-    }
-
     /// Runs the checks in the module docs.
     ///
     /// `previous` is the end of the range before: [`RangeLink::GENESIS`] for the range at
@@ -168,9 +163,10 @@ impl<'a> RangeBlob<'a> {
         mut visit: impl FnMut(&CompactBlockRecord) -> Result<(), Reject>,
     ) -> Result<RangeLink, Reject> {
         let entry = self.entry;
-        if !self.matches_digest() {
-            return Err(Reject::Refetch { start_height: entry.start_height });
-        }
+        // Do step 1 of the module docs: check the length and the digest.
+        entry
+            .check_blob(self.bytes)
+            .map_err(|mismatch| Reject::Refetch { start_height: entry.start_height, mismatch })?;
         let start = entry.start_height;
         if self.bytes.first() != Some(&entry.range_version) {
             return Err(Check::RangeVersion.at(start));
@@ -217,6 +213,8 @@ impl fmt::Debug for RangeBlob<'_> {
 /// The manifest entry that describes `blob`, a range of `records`.
 #[cfg(test)]
 pub(crate) fn entry_for(records: &[CompactBlockRecord], blob: &[u8]) -> ManifestEntry {
+    use ztreamer_indexer::index::range_meta::BlobDigest;
+
     let last = records.last().unwrap();
     ManifestEntry {
         range_version: blob[0],
@@ -287,12 +285,16 @@ mod tests {
     fn a_flipped_byte_or_a_wrong_length_needs_a_refetch() {
         let (first, second, blob) = second_range();
         let (entry, link) = (entry_for(&second, &blob), RangeLink::from(first.last().unwrap()));
-        let refetch = Err(Reject::Refetch { start_height: 1_000 });
+        let refetch = |mismatch| Err(Reject::Refetch { start_height: 1_000, mismatch });
 
         let mut flipped = blob.clone();
         flipped[blob.len() / 2] ^= 1;
-        assert_eq!(RangeBlob::new(&flipped, &entry).check(&link), refetch);
-        assert_eq!(RangeBlob::new(&blob[..blob.len() - 1], &entry).check(&link), refetch);
+        assert_eq!(RangeBlob::new(&flipped, &entry).check(&link), refetch(BlobMismatch::Digest));
+        let (expected, actual) = (blob.len() as u64, blob.len() as u64 - 1);
+        assert_eq!(
+            RangeBlob::new(&blob[..blob.len() - 1], &entry).check(&link),
+            refetch(BlobMismatch::Len { expected, actual })
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ use serde_with::{hex::Hex, serde_as};
 use tracing::warn;
 use ztreamer_indexer::index::{
     Index, IndexError,
-    range_meta::{BlobDigest, ManifestEntry},
+    range_meta::{BlobMismatch, ManifestEntry},
 };
 
 use crate::manifest::Manifest;
@@ -249,7 +249,7 @@ pub enum SnapshotWriteError {
     /// The blob of the range at this start height does not have the length or the digest of
     /// its entry.
     #[error("the blob of sealed range {0} does not match its manifest entry")]
-    BlobMismatch(u32),
+    BlobMismatch(u32, #[source] BlobMismatch),
     /// A manifest with this path is present.
     #[error("{0} exists, and a manifest is never replaced")]
     ManifestExists(String),
@@ -305,9 +305,9 @@ impl SnapshotWriter {
     /// Checks `blob` against the length and the digest in `entry`. Then it writes `blob` to the
     /// range file of `entry`.
     pub fn put_range(&self, entry: &ManifestEntry, blob: &[u8]) -> Result<(), SnapshotWriteError> {
-        if blob.len() as u64 != entry.blob_len || BlobDigest::hash(blob) != entry.blob_digest {
-            return Err(SnapshotWriteError::BlobMismatch(entry.start_height));
-        }
+        entry
+            .check_blob(blob)
+            .map_err(|mismatch| SnapshotWriteError::BlobMismatch(entry.start_height, mismatch))?;
         Ok(self.put(RangePath::from(entry).as_str(), blob)?)
     }
 
@@ -375,6 +375,7 @@ impl SnapshotWriter {
 mod tests {
     use chrono::TimeDelta;
     use zakura_chain::parameters::Network;
+    use ztreamer_indexer::index::range_meta::BlobDigest;
 
     use super::*;
     use crate::{
@@ -455,7 +456,10 @@ mod tests {
 
         let error = writer.put_range(&entry, b"other").unwrap_err();
 
-        assert!(matches!(error, SnapshotWriteError::BlobMismatch(0)), "{error:?}");
+        assert!(
+            matches!(error, SnapshotWriteError::BlobMismatch(0, BlobMismatch::Digest)),
+            "{error:?}"
+        );
         assert!(!dir.path().join(RangePath::from(&entry).as_str()).exists());
     }
 

@@ -1,19 +1,16 @@
-//! Conversion between [`ExportedRange`] and the Replicator `ManifestEntry` message.
+//! Conversion between [`ManifestEntry`] and the Replicator `ManifestEntry` message.
 //!
 //! Hashes, digests and subtree roots are 32 bytes, in the byte order that the `range_meta` layout
 //! uses. The conversion to the message cannot fail. The conversion from the message refuses
 //! wrong lengths, numbers too large for their type, and unknown enum values.
 
-use sapling_crypto::Node as SaplingNode;
-use zakura_chain::{block, ironwood, orchard, subtree::NoteCommitmentSubtreeIndex};
+use zakura_chain::{block, subtree::NoteCommitmentSubtreeIndex};
 use ztreamer_protocol::replicate;
 
-use super::{
-    BlobDigest, ExportedRange, Frontiers, ManifestEntry, SubtreeNode, SubtreeRoot, VerifyState,
-};
+use super::{BlobDigest, Frontiers, ManifestEntry, NodeBytes, Pool, SubtreeRoot};
 use crate::codec::TreeSizes;
 
-/// Why a Replicator `ManifestEntry` does not convert to an [`ExportedRange`]. Each variant names
+/// Why a Replicator `ManifestEntry` does not convert to a [`ManifestEntry`]. Each variant names
 /// the message field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum WireError {
@@ -34,9 +31,8 @@ pub enum WireError {
     SubtreeRoot(u16),
 }
 
-impl From<ExportedRange> for replicate::ManifestEntry {
-    fn from(range: ExportedRange) -> Self {
-        let ExportedRange { entry, state } = range;
+impl From<ManifestEntry> for replicate::ManifestEntry {
+    fn from(entry: ManifestEntry) -> Self {
         let TreeSizes { sapling, orchard, ironwood } = entry.end_tree_sizes;
         Self {
             range_version: entry.range_version.into(),
@@ -53,82 +49,61 @@ impl From<ExportedRange> for replicate::ManifestEntry {
             blob_digest: entry.blob_digest.0.to_vec(),
             blob_len: entry.blob_len,
             epoch_end: entry.epoch_end,
-            state: state.into_wire().into(),
         }
     }
 }
 
-impl TryFrom<replicate::ManifestEntry> for ExportedRange {
+impl TryFrom<replicate::ManifestEntry> for ManifestEntry {
     type Error = WireError;
 
     fn try_from(entry: replicate::ManifestEntry) -> Result<Self, WireError> {
         let sizes = entry.end_tree_sizes.ok_or(WireError::Missing("end_tree_sizes"))?;
         let frontiers = entry.frontiers.ok_or(WireError::Missing("frontiers"))?;
         Ok(Self {
-            entry: ManifestEntry {
-                range_version: entry
-                    .range_version
-                    .try_into()
-                    .map_err(|_| WireError::Overflow("range_version"))?,
-                start_height: entry.start_height,
-                end_height: entry.end_height,
-                end_hash: block::Hash(fixed("end_hash", entry.end_hash)?),
-                end_tree_sizes: TreeSizes {
-                    sapling: sizes.sapling,
-                    orchard: sizes.orchard,
-                    ironwood: sizes.ironwood,
-                },
-                frontiers: Frontiers {
-                    sapling: frontiers.sapling,
-                    orchard: frontiers.orchard,
-                    ironwood: frontiers.ironwood,
-                },
-                subtree_roots: entry
-                    .subtree_roots
-                    .into_iter()
-                    .map(SubtreeRoot::try_from_wire)
-                    .collect::<Result<_, _>>()?,
-                blob_digest: BlobDigest(fixed("blob_digest", entry.blob_digest)?),
-                blob_len: entry.blob_len,
-                epoch_end: entry.epoch_end,
+            range_version: entry
+                .range_version
+                .try_into()
+                .map_err(|_| WireError::Overflow("range_version"))?,
+            start_height: entry.start_height,
+            end_height: entry.end_height,
+            end_hash: block::Hash(fixed("end_hash", entry.end_hash)?),
+            end_tree_sizes: TreeSizes {
+                sapling: sizes.sapling,
+                orchard: sizes.orchard,
+                ironwood: sizes.ironwood,
             },
-            state: VerifyState::try_from_wire(entry.state)?,
+            frontiers: Frontiers {
+                sapling: frontiers.sapling,
+                orchard: frontiers.orchard,
+                ironwood: frontiers.ironwood,
+            },
+            subtree_roots: entry
+                .subtree_roots
+                .into_iter()
+                .map(SubtreeRoot::try_from_wire)
+                .collect::<Result<_, _>>()?,
+            blob_digest: BlobDigest(fixed("blob_digest", entry.blob_digest)?),
+            blob_len: entry.blob_len,
+            epoch_end: entry.epoch_end,
         })
     }
 }
 
 impl SubtreeRoot {
     fn into_wire(self) -> replicate::SubtreeRoot {
-        let (pool, root) = match self.root {
-            SubtreeNode::Sapling(node) => (replicate::Pool::Sapling, node.to_bytes()),
-            SubtreeNode::Orchard(node) => (replicate::Pool::Orchard, node.to_repr()),
-            SubtreeNode::Ironwood(node) => (replicate::Pool::Ironwood, node.to_repr()),
-        };
         replicate::SubtreeRoot {
-            pool: pool.into(),
+            pool: replicate::Pool::from(self.root.pool()).into(),
             index: self.index.0.into(),
-            root: root.to_vec(),
+            root: self.root.to_bytes().as_ref().to_vec(),
         }
     }
 
     fn try_from_wire(root: replicate::SubtreeRoot) -> Result<Self, WireError> {
         let index =
             u16::try_from(root.index).map_err(|_| WireError::Overflow("subtree_roots.index"))?;
-        let bytes = fixed("subtree_roots.root", root.root)?;
-        let node = match replicate::Pool::try_from(root.pool) {
-            Ok(replicate::Pool::Sapling) => {
-                Option::from(SaplingNode::from_bytes(bytes)).map(SubtreeNode::Sapling)
-            }
-            Ok(replicate::Pool::Orchard) => {
-                orchard::tree::Node::try_from(bytes).ok().map(SubtreeNode::Orchard)
-            }
-            Ok(replicate::Pool::Ironwood) => {
-                ironwood::tree::Node::try_from(bytes).ok().map(SubtreeNode::Ironwood)
-            }
-            Ok(replicate::Pool::Unspecified) | Err(_) => {
-                return Err(WireError::Enum("subtree_roots.pool", root.pool));
-            }
-        };
+        let bytes =
+            NodeBytes::try_from(root.root).map_err(|_| WireError::Length("subtree_roots.root"))?;
+        let node = Pool::try_from_wire(root.pool)?.node(bytes);
         Ok(Self {
             index: NoteCommitmentSubtreeIndex(index),
             root: node.ok_or(WireError::SubtreeRoot(index))?,
@@ -136,22 +111,24 @@ impl SubtreeRoot {
     }
 }
 
-impl VerifyState {
-    const fn into_wire(self) -> replicate::VerifyState {
-        match self {
-            Self::Unverified => replicate::VerifyState::Unverified,
-            Self::Verified => replicate::VerifyState::Verified,
-            Self::Rejected => replicate::VerifyState::Rejected,
+impl From<Pool> for replicate::Pool {
+    fn from(pool: Pool) -> Self {
+        match pool {
+            Pool::Sapling => Self::Sapling,
+            Pool::Orchard => Self::Orchard,
+            Pool::Ironwood => Self::Ironwood,
         }
     }
+}
 
+impl Pool {
     fn try_from_wire(value: i32) -> Result<Self, WireError> {
-        match replicate::VerifyState::try_from(value) {
-            Ok(replicate::VerifyState::Unverified) => Ok(Self::Unverified),
-            Ok(replicate::VerifyState::Verified) => Ok(Self::Verified),
-            Ok(replicate::VerifyState::Rejected) => Ok(Self::Rejected),
-            Ok(replicate::VerifyState::Unspecified) | Err(_) => {
-                Err(WireError::Enum("state", value))
+        match replicate::Pool::try_from(value) {
+            Ok(replicate::Pool::Sapling) => Ok(Self::Sapling),
+            Ok(replicate::Pool::Orchard) => Ok(Self::Orchard),
+            Ok(replicate::Pool::Ironwood) => Ok(Self::Ironwood),
+            Ok(replicate::Pool::Unspecified) | Err(_) => {
+                Err(WireError::Enum("subtree_roots.pool", value))
             }
         }
     }
@@ -166,31 +143,26 @@ mod tests {
     use super::*;
     use crate::index::range_meta::full_meta;
 
-    fn exported() -> ExportedRange {
-        let meta = full_meta(2_000);
-        ExportedRange { entry: meta.entry, state: meta.state }
+    /// An entry with subtree roots of the Sapling, Orchard and Ironwood pools.
+    fn entry() -> ManifestEntry {
+        let mut entry = full_meta(2_000).entry;
+        entry.subtree_roots.extend(full_meta(2_000).attested.unwrap().subtree_roots);
+        entry
     }
 
     #[test]
-    fn an_entry_round_trips_in_every_state() {
-        for state in [VerifyState::Unverified, VerifyState::Verified, VerifyState::Rejected] {
-            let range = ExportedRange { state, ..exported() };
-            let wire = replicate::ManifestEntry::from(range.clone());
-            assert_eq!(wire.end_hash.len(), 32);
-            assert_eq!(ExportedRange::try_from(wire).unwrap(), range);
-        }
-    }
-
-    #[test]
-    fn the_reserved_chain_ok_value_is_refused() {
-        // 2 was `VERIFY_STATE_CHAIN_OK`.
-        assert_eq!(VerifyState::try_from_wire(2), Err(WireError::Enum("state", 2)));
+    fn an_entry_round_trips() {
+        let wire = replicate::ManifestEntry::from(entry());
+        assert_eq!(wire.end_hash.len(), 32);
+        let pools: Vec<_> = wire.subtree_roots.iter().map(|root| root.pool).collect();
+        assert_eq!(pools, [1, 2, 3]);
+        assert_eq!(ManifestEntry::try_from(wire).unwrap(), entry());
     }
 
     #[test]
     fn a_bad_message_is_refused_with_its_field() {
         type Change = fn(&mut replicate::ManifestEntry);
-        let cases: [(Change, WireError); 7] = [
+        let cases: [(Change, WireError); 6] = [
             (|wire| wire.end_tree_sizes = None, WireError::Missing("end_tree_sizes")),
             (|wire| wire.end_hash.truncate(31), WireError::Length("end_hash")),
             (|wire| wire.range_version = 256, WireError::Overflow("range_version")),
@@ -201,12 +173,11 @@ mod tests {
             (|wire| wire.subtree_roots[0].pool = 0, WireError::Enum("subtree_roots.pool", 0)),
             // All ones is above every pool's field modulus.
             (|wire| wire.subtree_roots[1].root = vec![0xff; 32], WireError::SubtreeRoot(0)),
-            (|wire| wire.state = 9, WireError::Enum("state", 9)),
         ];
         for (change, error) in cases {
-            let mut wire = replicate::ManifestEntry::from(exported());
+            let mut wire = replicate::ManifestEntry::from(entry());
             change(&mut wire);
-            assert_eq!(ExportedRange::try_from(wire), Err(error));
+            assert_eq!(ManifestEntry::try_from(wire), Err(error));
         }
     }
 }

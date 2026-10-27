@@ -34,14 +34,15 @@ use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Code, Streaming, transport::Channel};
 use tracing::{debug, warn};
 use zakura_chain::block;
-use ztreamer_indexer::index::range_meta::{ExportedRange, ManifestEntry, WireError};
+use ztreamer_indexer::index::range_meta::{
+    BlobMismatch, MANIFEST_VERSION, ManifestEntry, WireError,
+};
 use ztreamer_protocol::replicate::{
     self, GetRangeRequest, ListRangesRequest, RangeChunk, replicator_client::ReplicatorClient,
 };
 
 use crate::{
-    manifest::{MANIFEST_VERSION, Manifest, ManifestError},
-    range::RangeBlob,
+    manifest::{Manifest, ManifestError},
     snapshot::{Latest, LatestError, RangePath, SignatureFile},
 };
 
@@ -126,6 +127,9 @@ pub enum FetchError {
     Digest {
         /// The first height of the range.
         start_height: u32,
+        /// The value that does not match: the length or the digest.
+        #[source]
+        mismatch: BlobMismatch,
     },
 }
 
@@ -206,10 +210,10 @@ impl Fetcher {
             let (start_height, offset) = (entry.start_height, blob.len());
             warn!(%error, start_height, offset, "range transfer stopped; resuming");
         }
-        if RangeBlob::new(&blob, entry).matches_digest() {
-            return Ok(blob.freeze());
-        }
-        Err(FetchError::Digest { start_height: entry.start_height })
+        entry
+            .check_blob(&blob)
+            .map(|()| blob.freeze())
+            .map_err(|mismatch| FetchError::Digest { start_height: entry.start_height, mismatch })
     }
 
     /// Appends the bytes of the blob of `entry` from `blob.len()` to `blob`, with one request.
@@ -445,7 +449,7 @@ impl RangeSource for PeerSource {
             client.list_ranges(ListRangesRequest { from_start_height: 0 }).await?.into_inner();
         let mut entries = Vec::new();
         while let Some(entry) = listed.message().await? {
-            let entry = ExportedRange::try_from(entry)?.entry;
+            let entry = ManifestEntry::try_from(entry)?;
             let next = entries.last().map_or(0, |last: &ManifestEntry| last.end_height + 1);
             if entry.start_height != next {
                 break;
@@ -485,7 +489,7 @@ mod tests {
     use zakura_chain::parameters::Network;
     use ztreamer_indexer::index::RANGE_SIZE;
     use ztreamer_protocol::replicate::replicator_server::ReplicatorServer;
-    use ztreamer_service::{ReplicatorService, ServingSnapshot, replicate::MAX_RANGE_STREAMS};
+    use ztreamer_service::{MAX_RANGE_STREAMS, ReplicatorService, ServingSnapshot};
 
     use super::*;
     use crate::test_utils::{FileServer, PeerServer, SEED, Snapshot, SourceIndex};
@@ -577,7 +581,10 @@ mod tests {
 
         let error = fetcher.blob(entry).await.unwrap_err();
 
-        assert!(matches!(error, FetchError::Digest { start_height: 0 }), "{error:?}");
+        assert!(
+            matches!(error, FetchError::Digest { start_height: 0, mismatch: BlobMismatch::Digest }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

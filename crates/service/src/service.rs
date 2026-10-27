@@ -81,6 +81,12 @@ pub struct Readiness {
 }
 
 impl ServingSnapshot {
+    /// Returns the generation of the snapshot. Returns `UNAVAILABLE` while deep reorg recovery
+    /// runs.
+    pub(crate) fn ready_generation(&self) -> Result<u64, Status> {
+        ensure_ready(self).map(|()| self.generation)
+    }
+
     fn with_head(
         state: IndexState,
         volatile_head: Vec<CompactBlockRecord>,
@@ -397,7 +403,7 @@ fn reorganized(height: u32) -> Status {
     ))
 }
 
-fn index_status(error: IndexError) -> Status {
+pub(crate) fn index_status(error: IndexError) -> Status {
     match error {
         IndexError::Coverage { .. } => Status::out_of_range(error.to_string()),
         IndexError::Generation { .. } => Status::unavailable(error.to_string()),

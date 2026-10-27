@@ -28,19 +28,18 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_with::{DeserializeAs, DisplayFromStr, SerializeAs, hex::Hex, serde_as};
-use zakura_chain::{block, ironwood, orchard, subtree::NoteCommitmentSubtreeIndex};
+use zakura_chain::{block, subtree::NoteCommitmentSubtreeIndex};
 use ztreamer_indexer::{
     codec::TreeSizes,
     index::{
         RANGE_SIZE,
-        range_meta::{BlobDigest, Frontiers, ManifestEntry, SubtreeNode, SubtreeRoot},
+        range_meta::{
+            BlobDigest, Frontiers, MANIFEST_VERSION, ManifestEntry, NodeBytes, Pool, SubtreeRoot,
+        },
     },
 };
 
 use crate::epoch::Epochs;
-
-/// The manifest format version that this crate reads.
-pub const MANIFEST_VERSION: u32 = 1;
 
 /// A snapshot manifest that obeys the rules in the module docs.
 ///
@@ -290,63 +289,24 @@ struct TreeSizesJson {
     ironwood: u32,
 }
 
-/// A note commitment pool.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Pool {
-    /// The Sapling pool.
+/// The JSON form of [`Pool`]: its [`Pool::as_str`] name.
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "Pool", rename_all = "lowercase")]
+enum PoolJson {
     Sapling,
-    /// The Orchard pool.
     Orchard,
-    /// The Ironwood pool.
     Ironwood,
-}
-
-impl Pool {
-    /// The three pools.
-    pub const ALL: [Self; 3] = [Self::Sapling, Self::Orchard, Self::Ironwood];
-
-    /// The name of the pool in the manifest and in `z_getsubtreesbyindex`.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sapling => "sapling",
-            Self::Orchard => "orchard",
-            Self::Ironwood => "ironwood",
-        }
-    }
-
-    /// Reads a subtree root of this pool from `bytes` in the byte order of the pool, as
-    /// `z_getsubtreesbyindex` prints it. Returns `None` when the bytes are not a node of the pool.
-    pub fn subtree_node(self, bytes: [u8; 32]) -> Option<SubtreeNode> {
-        match self {
-            Self::Sapling => {
-                Option::from(sapling_crypto::Node::from_bytes(bytes)).map(SubtreeNode::Sapling)
-            }
-            Self::Orchard => orchard::tree::Node::try_from(bytes).ok().map(SubtreeNode::Orchard),
-            Self::Ironwood => ironwood::tree::Node::try_from(bytes).ok().map(SubtreeNode::Ironwood),
-        }
-    }
-}
-
-impl From<&SubtreeNode> for Pool {
-    /// The pool of a subtree root.
-    fn from(node: &SubtreeNode) -> Self {
-        match node {
-            SubtreeNode::Sapling(_) => Self::Sapling,
-            SubtreeNode::Orchard(_) => Self::Orchard,
-            SubtreeNode::Ironwood(_) => Self::Ironwood,
-        }
-    }
 }
 
 /// The JSON form of a [`SubtreeRoot`].
 #[serde_as]
 #[derive(Deserialize, Serialize)]
 struct SubtreeRootJson {
+    #[serde(with = "PoolJson")]
     pool: Pool,
     index: u16,
     #[serde_as(as = "Hex")]
-    root: [u8; 32],
+    root: NodeBytes,
 }
 
 /// The root bytes are not a field element of the pool.
@@ -420,12 +380,7 @@ impl<'de> DeserializeAs<'de, ManifestEntry> for EntryJson {
 
 impl From<&SubtreeRoot> for SubtreeRootJson {
     fn from(root: &SubtreeRoot) -> Self {
-        let (pool, bytes) = match root.root {
-            SubtreeNode::Sapling(node) => (Pool::Sapling, node.to_bytes()),
-            SubtreeNode::Orchard(node) => (Pool::Orchard, node.to_repr()),
-            SubtreeNode::Ironwood(node) => (Pool::Ironwood, node.to_repr()),
-        };
-        Self { pool, index: root.index.0, root: bytes }
+        Self { pool: root.root.pool(), index: root.index.0, root: root.root.to_bytes() }
     }
 }
 
@@ -434,7 +389,7 @@ impl TryFrom<SubtreeRootJson> for SubtreeRoot {
 
     fn try_from(json: SubtreeRootJson) -> Result<Self, Self::Error> {
         let SubtreeRootJson { pool, index, root } = json;
-        pool.subtree_node(root)
+        pool.node(root)
             .map(|root| Self { index: NoteCommitmentSubtreeIndex(index), root })
             .ok_or(InvalidSubtreeRoot { pool, index })
     }
@@ -443,7 +398,8 @@ impl TryFrom<SubtreeRootJson> for SubtreeRoot {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
-    use ztreamer_indexer::test_utils::hash;
+    use zakura_chain::{ironwood, orchard};
+    use ztreamer_indexer::{index::range_meta::SubtreeNode, test_utils::hash};
 
     use super::*;
     use crate::epoch::synthetic_entries;
