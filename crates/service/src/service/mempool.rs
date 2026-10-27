@@ -12,11 +12,8 @@ use zakura_chain::{
 };
 use ztreamer_protocol::proto;
 
-use super::{CompactService, RpcStream};
+use super::{CompactService, RpcStream, ensure_tip_ready};
 use crate::project::{PoolSelection, compact_mempool_txs, excluded_txids};
-
-/// The error of a mempool stream whose service stopped before the tip changed.
-const SERVICE_STOPPED: &str = "the service stopped";
 
 impl CompactService {
     pub(crate) async fn send_transaction(
@@ -32,13 +29,24 @@ impl CompactService {
     pub(crate) async fn mempool_stream(&self) -> Result<RpcStream<proto::RawTransaction>, Status> {
         let backend = Arc::clone(&self.backend);
         let mut snapshots = self.subscribe();
-        let tip = snapshots.borrow().visible_tip;
+        let tip = {
+            let snapshot = snapshots.borrow();
+            ensure_tip_ready(&snapshot)?;
+            snapshot.visible_tip
+        };
         let mut transactions = backend.mempool_transactions().await?;
         let (sender, receiver) = mpsc::channel(1);
         tokio::spawn(async move {
-            // The stream ends when the head follower publishes a new visible tip.
+            // The stream ends when the head follower publishes a new visible tip. It fails when
+            // the head is stale or in deep reorg recovery, because then no new tip comes.
             let tip_changed = async move {
-                snapshots.wait_for(|snapshot| snapshot.visible_tip != tip).await.map(|_| ())
+                let snapshot = snapshots
+                    .wait_for(|snapshot| {
+                        snapshot.visible_tip != tip || ensure_tip_ready(snapshot).is_err()
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("the service stopped"))?;
+                ensure_tip_ready(&snapshot)
             };
             tokio::pin!(tip_changed);
             let mut seen = HashSet::new();
@@ -57,8 +65,8 @@ impl CompactService {
                     tokio::select! {
                         biased;
                         changed = &mut tip_changed => {
-                            if changed.is_err() {
-                                let _ = sender.send(Err(Status::unavailable(SERVICE_STOPPED))).await;
+                            if let Err(status) = changed {
+                                let _ = sender.send(Err(status)).await;
                             }
                             return;
                         }
@@ -73,11 +81,14 @@ impl CompactService {
                 transactions = tokio::select! {
                     biased;
                     changed = &mut tip_changed => {
-                        if changed.is_err() {
-                            let _ = sender.send(Err(Status::unavailable(SERVICE_STOPPED))).await;
+                        if let Err(status) = changed {
+                            let _ = sender.send(Err(status)).await;
                         }
                         return;
                     }
+                    // The client is gone. Without this, an idle stream sends nothing, and
+                    // thus it does not see the closed channel.
+                    () = sender.closed() => return,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
                         match backend.mempool_transactions().await {
                             Ok(transactions) => transactions,
@@ -145,8 +156,8 @@ mod tests {
 
     use crate::RemoteBackend;
 
-    #[tokio::test]
-    async fn mempool_stream_ends_when_the_visible_tip_changes() {
+    /// A service over an empty index and a remote node with an empty mempool. Its head is fresh.
+    async fn remote_service() -> (CompactService, MockNode, tempfile::TempDir) {
         let mock = MockNode::start(|_, seen| match seen.body["method"].as_str().unwrap() {
             "getblockchaininfo" => {
                 Reply::Result(serde_json::to_value(GetBlockchainInfoResponse::default()).unwrap())
@@ -162,17 +173,58 @@ mod tests {
             Arc::new(Index::open(dir.path(), 10 << 20, "Mainnet", block::Hash([9; 32])).unwrap());
         let state = index.state().unwrap();
         let service = CompactService::with_backend(index, state, "main", backend);
+        service.snapshot.send_modify(|snapshot| snapshot.tip_fresh = true);
+        (service, mock, dir)
+    }
+
+    const WAIT: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn mempool_stream_ends_when_the_visible_tip_changes() {
+        let (service, _mock, _dir) = remote_service().await;
         let mut stream = service.mempool_stream().await.unwrap();
 
         // A new snapshot with the same visible tip does not end the stream.
         service.snapshot.send_modify(|snapshot| snapshot.generation += 1);
-        let wait = Duration::from_millis(300);
-        assert!(tokio::time::timeout(wait, stream.next()).await.is_err());
+        assert!(tokio::time::timeout(WAIT, stream.next()).await.is_err());
 
         service.snapshot.send_modify(|snapshot| {
             snapshot.visible_tip = Some(BlockId::new(1, block::Hash([1; 32])));
         });
-        assert!(tokio::time::timeout(10 * wait, stream.next()).await.unwrap().is_none());
+        assert!(tokio::time::timeout(10 * WAIT, stream.next()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mempool_stream_fails_while_the_head_is_stale() {
+        let (service, _mock, _dir) = remote_service().await;
+        let mut stream = service.mempool_stream().await.unwrap();
+
+        // No new tip comes while the head is stale, so the stream fails.
+        service.snapshot.send_modify(|snapshot| snapshot.tip_fresh = false);
+        let error = tokio::time::timeout(10 * WAIT, stream.next()).await.unwrap().unwrap();
+        assert_eq!(error.unwrap_err().code(), tonic::Code::Unavailable);
+        assert!(stream.next().await.is_none());
+
+        // A stale head also refuses a new stream.
+        let error = service.mempool_stream().await.err().unwrap();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn mempool_stream_task_ends_when_the_client_is_gone() {
+        let (service, _mock, _dir) = remote_service().await;
+        let stream = service.mempool_stream().await.unwrap();
+        // The task of the stream holds the only snapshot receiver.
+        assert_eq!(service.snapshot.receiver_count(), 1);
+
+        drop(stream);
+        tokio::time::timeout(10 * WAIT, async {
+            while service.snapshot.receiver_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
