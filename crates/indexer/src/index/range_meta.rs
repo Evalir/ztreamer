@@ -2,8 +2,8 @@
 //!
 //! A record is what a replica needs to know about a range without decoding its blocks: the
 //! manifest entry a snapshot publishes for it, how far the range has been verified against a
-//! node, and the node's answers so that they are never asked for twice. Embedded mode never
-//! writes this table; a filler task and the importer do.
+//! node, and the node's answers so that they are never asked for twice. In embedded mode, the
+//! `range_meta` filler writes this table. In remote mode, the importer writes it.
 //!
 //! # Layout
 //!
