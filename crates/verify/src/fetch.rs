@@ -21,7 +21,7 @@ use std::{fmt, pin::Pin, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use http::{Request, StatusCode, Uri, header::RANGE};
 use http_body_util::{BodyExt as _, Empty};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -42,7 +42,7 @@ use ztreamer_protocol::replicate::{
 use crate::{
     manifest::{MANIFEST_VERSION, Manifest, ManifestError},
     range::RangeBlob,
-    snapshot::{Latest, LatestError, RangePath, SIGNATURE_SUFFIX},
+    snapshot::{Latest, LatestError, RangePath, SignatureFile},
 };
 
 /// The times that [`Fetcher::blob`] continues one blob after a transfer error.
@@ -303,12 +303,10 @@ impl HttpSource {
     /// caller.
     async fn signed(&self, path: &str) -> Result<Bytes, FetchError> {
         let bytes = self.read(path).await?;
-        let signature_path = format!("{path}{SIGNATURE_SUFFIX}");
-        let hex = self.read(&signature_path).await?;
-        let refused = || FetchError::Signature { path: path.to_owned() };
-        let signature = hex::decode(hex.trim_ascii()).map_err(|_| refused())?;
-        let signature = Signature::from_slice(&signature).map_err(|_| refused())?;
-        self.key.verify_strict(&bytes, &signature).map_err(|_| refused())?;
+        let signature = self.read(&SignatureFile::path_of(path)).await?;
+        SignatureFile::try_from(&signature[..])
+            .and_then(|signature| signature.verify(&bytes, &self.key))
+            .map_err(|_| FetchError::Signature { path: path.to_owned() })?;
         Ok(bytes)
     }
 
@@ -534,18 +532,17 @@ mod tests {
     #[tokio::test]
     async fn a_bad_signature_refuses_the_manifest() {
         let http = Http::new().await;
-        // `latest.json` holds the key of seed 8. The source does not trust it.
+        // `latest.json` holds the key of `SEED`. A source must not trust it.
         let error = http.fetcher([8; 32]).manifest().await.unwrap_err();
         assert!(matches!(error, FetchError::Latest(LatestError::Signature)), "{error:?}");
 
-        let other = SigningKey::from_bytes(&[9; 32]);
-        let bytes = std::fs::read(http.snapshot.dir.path().join(Snapshot::MANIFEST)).unwrap();
-        http.snapshot.write_signed_with(Snapshot::MANIFEST, &bytes, &other);
+        let manifest = &http.snapshot.manifest_path;
+        let bytes = std::fs::read(http.snapshot.dir.path().join(manifest)).unwrap();
+        let other = SignatureFile::sign(&bytes, &SigningKey::from_bytes(&[9; 32]));
+        let signature = http.snapshot.dir.path().join(SignatureFile::path_of(manifest));
+        std::fs::write(signature, other.to_hex()).unwrap();
         let error = http.fetcher(SEED).manifest().await.unwrap_err();
-        assert!(
-            matches!(&error, FetchError::Signature { path } if path == Snapshot::MANIFEST),
-            "{error:?}"
-        );
+        assert!(matches!(&error, FetchError::Signature { path } if path == manifest), "{error:?}");
     }
 
     #[tokio::test]

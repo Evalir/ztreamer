@@ -4,9 +4,11 @@
 //! ```text
 //! latest.json                         the signed pointer to the current manifest: Latest
 //! manifests/<time>.json               one entry per sealed range; never replaced
-//! manifests/<time>.json.sig           Ed25519 signature of the manifest bytes, hex
+//! manifests/<time>.json.sig           SignatureFile of the manifest bytes
 //! ranges/<start>-<digest prefix>.bin  range blob, at RangePath; never replaced
 //! ```
+//!
+//! `<time>` is UTC, for example `2026-10-26T143005Z`. [`SnapshotWriter`] writes the directory.
 //!
 //! `latest.json` is the only file that an export replaces. It holds its own signature, so that a
 //! reader never sees a new pointer with an old signature:
@@ -20,13 +22,24 @@
 //! that it trusts, never with `public_key`: a source that can change the file can also change
 //! that key.
 
-use std::fmt;
+use std::{
+    fs::{self, File},
+    io::{self, Write as _},
+    path::PathBuf,
+};
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_with::{hex::Hex, serde_as};
-use ztreamer_indexer::index::range_meta::ManifestEntry;
+use tracing::warn;
+use ztreamer_indexer::index::{
+    Index, IndexError,
+    range_meta::{BlobDigest, ManifestEntry},
+};
+
+use crate::manifest::Manifest;
 
 /// The Ed25519 public key that signs the snapshots that a replica accepts.
 ///
@@ -38,9 +51,6 @@ pub const SNAPSHOT_PUBKEY: [u8; 32] = [
     0x3f, 0x1f, 0xd7, 0xb1, 0xdd, 0x78, 0xfb, 0x15, 0x7d, 0xf5, 0x8e, 0x11, 0xb8, 0x70, 0xbc, 0x2b,
 ];
 
-/// The end of the path of a signature file: `<file>.sig` signs `<file>`.
-pub const SIGNATURE_SUFFIX: &str = ".sig";
-
 /// The pointer to the current manifest of a snapshot, in `latest.json`.
 #[serde_as]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -51,11 +61,9 @@ pub struct Latest {
     pub sealed_through: u32,
     /// The export time, RFC 3339 in UTC.
     pub published_at: String,
-    /// The key that signed the manifest and this pointer. Absent if the export is not signed.
-    /// A reader must not trust it.
-    #[serde_as(as = "Option<Hex>")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_key: Option<[u8; 32]>,
+    /// The key that signed the manifest and this pointer. A reader must not trust it.
+    #[serde_as(as = "Hex")]
+    pub public_key: [u8; 32],
 }
 
 /// The JSON of `latest.json`: the pointer and the signature of its exact bytes.
@@ -64,20 +72,16 @@ pub struct Latest {
 struct LatestFile<'a> {
     #[serde(borrow)]
     latest: &'a RawValue,
-    #[serde_as(as = "Option<Hex>")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    signature: Option<[u8; 64]>,
+    #[serde_as(as = "Hex")]
+    signature: [u8; 64],
 }
 
 /// Why `latest.json` was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum LatestError {
-    /// The file does not parse.
+    /// The file does not parse. A file without a signature does not parse.
     #[error("latest.json is not valid")]
     Json(#[from] serde_json::Error),
-    /// The file has no signature.
-    #[error("latest.json has no signature")]
-    Unsigned,
     /// The signature does not verify with the trusted key.
     #[error("signature of latest.json does not verify")]
     Signature,
@@ -87,10 +91,10 @@ impl Latest {
     /// The path of the pointer, relative to the snapshot directory.
     pub const PATH: &str = "latest.json";
 
-    /// The bytes of `latest.json`, signed with `key` when it is set.
-    pub fn to_file(&self, key: Option<&SigningKey>) -> Vec<u8> {
+    /// The bytes of `latest.json`, signed with `key`.
+    pub fn to_file(&self, key: &SigningKey) -> Vec<u8> {
         let latest = serde_json::to_string(self).expect("a Latest always serializes");
-        let signature = key.map(|key| key.sign(latest.as_bytes()).to_bytes());
+        let signature = key.sign(latest.as_bytes()).to_bytes();
         let latest = RawValue::from_string(latest).expect("serde_json wrote valid JSON");
         serde_json::to_vec(&LatestFile { latest: &latest, signature })
             .expect("a LatestFile always serializes")
@@ -100,10 +104,72 @@ impl Latest {
     /// trusts.
     pub fn from_file(bytes: &[u8], key: &VerifyingKey) -> Result<Self, LatestError> {
         let file: LatestFile<'_> = serde_json::from_slice(bytes)?;
-        let signature = file.signature.ok_or(LatestError::Unsigned)?;
-        key.verify_strict(file.latest.get().as_bytes(), &Signature::from_bytes(&signature))
+        key.verify_strict(file.latest.get().as_bytes(), &Signature::from_bytes(&file.signature))
             .map_err(|_| LatestError::Signature)?;
         Ok(serde_json::from_str(file.latest.get())?)
+    }
+}
+
+/// A detached signature. The file `<file>.sig` holds the Ed25519 signature of the bytes of
+/// `<file>`: 64 bytes in hex.
+///
+/// ```
+/// use ed25519_dalek::SigningKey;
+/// use ztreamer_verify::snapshot::SignatureFile;
+///
+/// let key = SigningKey::from_bytes(&[7; 32]);
+/// let file = SignatureFile::sign(b"manifest", &key).to_hex();
+/// let signature = SignatureFile::try_from(file.as_bytes()).unwrap();
+/// assert!(signature.verify(b"manifest", &key.verifying_key()).is_ok());
+/// assert_eq!(SignatureFile::path_of("manifests/a.json"), "manifests/a.json.sig");
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignatureFile(Signature);
+
+/// Why a reader refused a [`SignatureFile`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SignatureFileError {
+    /// The file is not 64 bytes in hex.
+    #[error("the signature file is not 64 bytes in hex")]
+    Encoding,
+    /// The signature does not verify with the key of the reader.
+    #[error("the signature does not verify")]
+    Mismatch,
+}
+
+impl SignatureFile {
+    /// The end of the path of a signature file.
+    pub const SUFFIX: &str = ".sig";
+
+    /// The signature of `bytes` with `key`.
+    pub fn sign(bytes: &[u8], key: &SigningKey) -> Self {
+        Self(key.sign(bytes))
+    }
+
+    /// The path of the signature file for the file at `path`: `path`, then [`Self::SUFFIX`].
+    pub fn path_of(path: &str) -> String {
+        format!("{path}{}", Self::SUFFIX)
+    }
+
+    /// The contents of the signature file: the signature in hex.
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0.to_bytes())
+    }
+
+    /// Verifies that this signature signs `bytes` with `key`.
+    pub fn verify(&self, bytes: &[u8], key: &VerifyingKey) -> Result<(), SignatureFileError> {
+        key.verify_strict(bytes, &self.0).map_err(|_| SignatureFileError::Mismatch)
+    }
+}
+
+impl TryFrom<&[u8]> for SignatureFile {
+    type Error = SignatureFileError;
+
+    /// Decodes the contents of a signature file. The hex can have ASCII whitespace before and
+    /// after it.
+    fn try_from(file: &[u8]) -> Result<Self, Self::Error> {
+        let bytes = hex::decode(file.trim_ascii()).map_err(|_| SignatureFileError::Encoding)?;
+        Signature::from_slice(&bytes).map(Self).map_err(|_| SignatureFileError::Encoding)
     }
 }
 
@@ -137,18 +203,185 @@ impl From<&ManifestEntry> for RangePath {
     }
 }
 
-impl fmt::Display for RangePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+/// Writes a snapshot directory in the layout of this module. One key signs the directory.
+///
+/// The writer writes each file to a temporary file next to its path. Then it renames the
+/// temporary file to the path. Thus a reader sees the old file or the new file, never a part of
+/// one.
+///
+/// The writer writes a range file only after it checks the blob against the length and the
+/// digest of its entry. Thus a file with the name and the length of its entry holds the range.
+/// [`Self::export`] does not read or write this file again: a daily export writes only the new
+/// ranges.
+///
+/// The writer never replaces a manifest. Each manifest has a new name. The writer writes it,
+/// then `latest.json`, which points at it.
+///
+/// The `Debug` output shows only the verifying key: `SigningKey` does not show its secret key.
+#[derive(Debug)]
+pub struct SnapshotWriter {
+    root: PathBuf,
+    key: SigningKey,
+}
+
+/// What [`SnapshotWriter::export`] wrote.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Exported {
+    /// The path of the manifest, relative to the snapshot directory.
+    pub manifest: String,
+    /// The number of range files that the export wrote. The other range files were present,
+    /// with the length of their entry.
+    pub written: usize,
+}
+
+/// Why a [`SnapshotWriter`] stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotWriteError {
+    /// A file operation failed.
+    #[error("write the snapshot directory")]
+    Io(#[from] io::Error),
+    /// The index read failed.
+    #[error("read the index")]
+    Index(#[from] IndexError),
+    /// The index has no blob for the sealed range at this start height.
+    #[error("sealed range {0} is not in the index")]
+    MissingRange(u32),
+    /// The blob of the range at this start height does not have the length or the digest of
+    /// its entry.
+    #[error("the blob of sealed range {0} does not match its manifest entry")]
+    BlobMismatch(u32),
+    /// A manifest with this path is present.
+    #[error("{0} exists, and a manifest is never replaced")]
+    ManifestExists(String),
+}
+
+impl SnapshotWriter {
+    /// A writer for the snapshot directory at `root`, which signs with `key`.
+    pub fn new(root: impl Into<PathBuf>, key: SigningKey) -> Self {
+        Self { root: root.into(), key }
+    }
+
+    /// Writes the range files of `manifest` from `index`. Then it writes `manifest` with the
+    /// name of `now`, as [`Self::publish`] does. Thus `latest.json` points only at files that
+    /// are present.
+    ///
+    /// It checks the manifest name before it writes a range file. If a file has this name, it
+    /// stops with [`SnapshotWriteError::ManifestExists`].
+    pub fn export(
+        &self,
+        index: &Index,
+        manifest: &Manifest,
+        now: DateTime<Utc>,
+    ) -> Result<Exported, SnapshotWriteError> {
+        let path = self.new_manifest_path(now)?;
+        let written = manifest.entries().iter().try_fold(0, |written, entry| {
+            if self.has_range(entry)? {
+                return Ok(written);
+            }
+            let start = entry.start_height;
+            let blob = index
+                .read_sealed_range_bytes(start)?
+                .ok_or(SnapshotWriteError::MissingRange(start))?;
+            self.put_range(entry, &blob)?;
+            Ok::<_, SnapshotWriteError>(written + 1)
+        })?;
+        self.put_manifest_and_latest(&path, manifest, now)?;
+        Ok(Exported { manifest: path, written })
+    }
+
+    /// Writes `manifest` and its [`SignatureFile`] at `manifests/<now>.json`. Then it writes a
+    /// `latest.json` that points at the manifest. The range files of `manifest` must be present.
+    /// Returns the path of the manifest, relative to the snapshot directory.
+    pub fn publish(
+        &self,
+        manifest: &Manifest,
+        now: DateTime<Utc>,
+    ) -> Result<String, SnapshotWriteError> {
+        let path = self.new_manifest_path(now)?;
+        self.put_manifest_and_latest(&path, manifest, now)?;
+        Ok(path)
+    }
+
+    /// Checks `blob` against the length and the digest in `entry`. Then it writes `blob` to the
+    /// range file of `entry`.
+    pub fn put_range(&self, entry: &ManifestEntry, blob: &[u8]) -> Result<(), SnapshotWriteError> {
+        if blob.len() as u64 != entry.blob_len || BlobDigest::hash(blob) != entry.blob_digest {
+            return Err(SnapshotWriteError::BlobMismatch(entry.start_height));
+        }
+        Ok(self.put(RangePath::from(entry).as_str(), blob)?)
+    }
+
+    /// The path of the manifest for `now`. It refuses the path if a file has it.
+    fn new_manifest_path(&self, now: DateTime<Utc>) -> Result<String, SnapshotWriteError> {
+        let path = format!("manifests/{}.json", now.format("%Y-%m-%dT%H%M%SZ"));
+        if self.root.join(&path).exists() {
+            return Err(SnapshotWriteError::ManifestExists(path));
+        }
+        Ok(path)
+    }
+
+    /// Returns `true` if the range file of `entry` is present with the length of `entry`. For a
+    /// file with a different length, it logs a warning and returns `false`. Then the caller
+    /// writes the file again.
+    fn has_range(&self, entry: &ManifestEntry) -> io::Result<bool> {
+        let path = self.root.join(RangePath::from(entry).as_str());
+        match fs::metadata(&path) {
+            Ok(file) if file.is_file() && file.len() == entry.blob_len => Ok(true),
+            Ok(_) => {
+                warn!(path = %path.display(), "range file has the wrong length; writing it again");
+                Ok(false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes the manifest at `path`, then its signature, then `latest.json`. For a short time,
+    /// the manifest is present without its signature. But `latest.json` points at the manifest
+    /// only after the signature is present.
+    fn put_manifest_and_latest(
+        &self,
+        path: &str,
+        manifest: &Manifest,
+        now: DateTime<Utc>,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(manifest).expect("a Manifest always serializes");
+        self.put(path, &bytes)?;
+        let signature = SignatureFile::sign(&bytes, &self.key);
+        self.put(&SignatureFile::path_of(path), signature.to_hex().as_bytes())?;
+        let latest = Latest {
+            manifest: path.to_owned(),
+            sealed_through: manifest.sealed_through(),
+            published_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
+            public_key: self.key.verifying_key().to_bytes(),
+        };
+        self.put(Latest::PATH, &latest.to_file(&self.key))
+    }
+
+    /// Writes `bytes` to a temporary file next to `relative`. Then it renames the temporary file
+    /// to `relative`.
+    fn put(&self, relative: &str, bytes: &[u8]) -> io::Result<()> {
+        let path = self.root.join(relative);
+        fs::create_dir_all(path.parent().expect("a file below the root has a parent"))?;
+        let temp = path.with_added_extension("tmp");
+        let mut file = File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(temp, path)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ztreamer_indexer::index::range_meta::BlobDigest;
+    use chrono::TimeDelta;
+    use zakura_chain::parameters::Network;
 
     use super::*;
-    use crate::epoch::synthetic_entries;
+    use crate::{
+        epoch::synthetic_entries,
+        fetch::{HttpSource, RangeSource as _},
+        test_utils::{FileServer, SEED, SourceIndex},
+    };
 
     #[test]
     fn the_snapshot_key_is_a_valid_key_that_is_not_weak() {
@@ -161,14 +394,14 @@ mod tests {
             manifest: "manifests/2026-10-26T000000Z.json".to_owned(),
             sealed_through: 2_999,
             published_at: "2026-10-26T00:00:00Z".to_owned(),
-            public_key: Some([9; 32]),
+            public_key: [9; 32],
         }
     }
 
     #[test]
     fn a_signed_latest_verifies_with_the_trusted_key_only() {
         let key = SigningKey::from_bytes(&[7; 32]);
-        let bytes = latest().to_file(Some(&key));
+        let bytes = latest().to_file(&key);
 
         assert_eq!(Latest::from_file(&bytes, &key.verifying_key()).unwrap(), latest());
         let other = SigningKey::from_bytes(&[8; 32]).verifying_key();
@@ -181,12 +414,28 @@ mod tests {
     #[test]
     fn an_unsigned_latest_is_refused() {
         let key = SigningKey::from_bytes(&[7; 32]).verifying_key();
-        let unsigned = Latest { public_key: None, ..latest() }.to_file(None);
+        let unsigned = serde_json::json!({ "latest": latest() }).to_string();
 
-        assert!(matches!(Latest::from_file(&unsigned, &key), Err(LatestError::Unsigned)));
-        let json: serde_json::Value = serde_json::from_slice(&unsigned).unwrap();
-        assert_eq!(json["latest"]["sealed_through"], 2_999);
-        assert!(json["latest"].get("public_key").is_none());
+        let error = Latest::from_file(unsigned.as_bytes(), &key).unwrap_err();
+
+        assert!(matches!(error, LatestError::Json(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_signature_file_verifies_its_bytes_with_its_key_only() {
+        let key = SigningKey::from_bytes(&SEED);
+        let file = format!("{}\n", SignatureFile::sign(b"manifest", &key).to_hex());
+        let signature = SignatureFile::try_from(file.as_bytes()).unwrap();
+
+        assert_eq!(signature.verify(b"manifest", &key.verifying_key()), Ok(()));
+        let other = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        assert_eq!(signature.verify(b"manifest", &other), Err(SignatureFileError::Mismatch));
+        let error = signature.verify(b"other bytes", &key.verifying_key());
+        assert_eq!(error, Err(SignatureFileError::Mismatch));
+        for file in [&file[..126], "zz"] {
+            let error = SignatureFile::try_from(file.as_bytes());
+            assert_eq!(error, Err(SignatureFileError::Encoding));
+        }
     }
 
     #[test]
@@ -195,5 +444,43 @@ mod tests {
         entry.blob_digest = BlobDigest([0xab; 32]);
 
         assert_eq!(RangePath::from(&entry).as_str(), "ranges/1000-abababab.bin");
+    }
+
+    #[test]
+    fn a_blob_that_does_not_match_its_entry_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SnapshotWriter::new(dir.path(), SigningKey::from_bytes(&SEED));
+        let mut entry = synthetic_entries(&[Default::default()]).pop().unwrap();
+        entry.blob_len = 5;
+
+        let error = writer.put_range(&entry, b"other").unwrap_err();
+
+        assert!(matches!(error, SnapshotWriteError::BlobMismatch(0)), "{error:?}");
+        assert!(!dir.path().join(RangePath::from(&entry).as_str()).exists());
+    }
+
+    /// Twelve ranges: the filler closes an epoch only at range 9. The first export has the first
+    /// epoch. The second export, on the next day, has all ranges.
+    #[tokio::test]
+    async fn http_source_reads_the_manifest_of_each_export() {
+        let source = SourceIndex::new(12).await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&SEED);
+        let http = HttpSource::new(FileServer::start(dir.path()).await.base, key.verifying_key());
+        let (http, writer) = (http.unwrap(), SnapshotWriter::new(dir.path(), key));
+        let entries = source.entries();
+        let manifest = |ranges| {
+            let entries = entries[..ranges].to_vec();
+            Manifest::new(Network::Mainnet.to_string(), Network::Mainnet.genesis_hash(), entries)
+                .unwrap()
+        };
+        let now = DateTime::from_timestamp(1_792_972_800, 0).unwrap();
+
+        for (ranges, written, now) in [(10, 10, now), (12, 2, now + TimeDelta::days(1))] {
+            let exported = writer.export(&source.index, &manifest(ranges), now).unwrap();
+
+            assert_eq!(exported.written, written);
+            assert_eq!(http.manifest().await.unwrap(), manifest(ranges));
+        }
     }
 }
