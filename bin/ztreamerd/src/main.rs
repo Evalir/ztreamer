@@ -234,6 +234,9 @@ async fn run_daemon(cli: DaemonArgs) -> Result<()> {
             head: client.clone(),
             backend: InProcessBackend::with_node(client),
         };
+        if sources.wait_ready(&shutdown).await?.is_break() {
+            return Ok(());
+        }
         let embedded = Some(Embedded { p2p: p2p.clone() });
         run_application(cli, grpc_server, index, &network, embedded, sources, shutdown.clone())
             .await
@@ -252,14 +255,11 @@ struct NodeSources<T, H, B> {
     backend: B,
 }
 
-/// The wait until a node mode can serve the daemon.
-trait Readiness {
-    /// Waits until the node is ready for the historical index pass. Breaks on shutdown.
-    async fn wait_ready(&self, shutdown: &CancellationToken) -> Result<ControlFlow<()>>;
-}
-
-impl<T, B> Readiness for NodeSources<T, node::NodeClient, B> {
-    /// Waits until Zakura is near the chain tip and has a finalized block. Breaks on shutdown.
+impl<T, B> NodeSources<T, node::NodeClient, B> {
+    /// Waits until the embedded Zakura is near the chain tip and has a finalized block. Then the
+    /// node is ready for the historical index pass. Breaks on shutdown.
+    ///
+    /// The remote mode waits in `RemoteNode::sources`, before it makes its sources.
     async fn wait_ready(&self, shutdown: &CancellationToken) -> Result<ControlFlow<()>> {
         let client = &self.head;
         info!("waiting for Zakura to sync near the chain tip");
@@ -288,8 +288,9 @@ struct Embedded {
     p2p: Arc<P2pCompactService>,
 }
 
-/// Indexes, then serves until shutdown. `embedded` is set when a node runs in this process. Then
-/// the p2p service gets the compact service, and the `range_meta` filler runs.
+/// Indexes, then serves until shutdown. The node of `sources` must be ready for the historical
+/// index pass. `embedded` is set when a node runs in this process. Then the p2p service gets the
+/// compact service, and the `range_meta` filler runs.
 async fn run_application<T, H, B>(
     cli: DaemonArgs,
     mut grpc_server: Server,
@@ -300,14 +301,10 @@ async fn run_application<T, H, B>(
     shutdown: CancellationToken,
 ) -> Result<()>
 where
-    NodeSources<T, H, B>: Readiness,
     T: HistoricalSource + Send + 'static,
     H: CanonicalBlockSource + Clone + 'static,
     B: StateBackend,
 {
-    if sources.wait_ready(&shutdown).await?.is_break() {
-        return Ok(());
-    }
     let NodeSources { tail, head, backend } = sources;
 
     let pipeline = PipelineConfig::from(&cli);

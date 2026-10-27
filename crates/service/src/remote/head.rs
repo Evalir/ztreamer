@@ -1,5 +1,7 @@
 //! [`CanonicalBlockSource`] over the JSON-RPC interface of a remote zakura node.
 
+use std::panic;
+
 use zakura_chain::block;
 use zakura_state::HashOrHeight;
 use ztreamer_indexer::{
@@ -14,9 +16,8 @@ use ztreamer_remote::ZakuraClient;
 /// [`CompactService::sync_head`](crate::CompactService::sync_head) and
 /// [`CompactService::follow_head`](crate::CompactService::follow_head) use it as they use the
 /// embedded node. Each [`CanonicalBlockSource::block_hash`] call sends one `getblockhash`
-/// request. Each [`CanonicalBlockSource::block`] call sends two requests: `getblockhash` for the
-/// height, then `getblock` with verbosity 0 for that hash. The block bytes go into the index
-/// without a second serialization.
+/// request. Each [`CanonicalBlockSource::block`] call sends one `getblock` request with the
+/// height and verbosity 0. The block bytes go into the index without a second serialization.
 ///
 /// ```no_run
 /// use ztreamer_remote::{RpcClient, ZakuraClient};
@@ -52,24 +53,23 @@ impl CanonicalBlockSource for RemoteHeadSource {
 
     /// The best-chain block at `height`, or `None` when the node has no block at that height.
     ///
-    /// When the block leaves the best chain between the two requests, the node does not find
-    /// its hash and the result is [`HeadError::Changed`].
+    /// It decodes the block on the blocking thread pool. The hash comes from the block. [`poll_canonical_head`] checks that each block links to
+    /// the block below it. After the reads, it reads the hash of the last block again.
+    ///
+    /// [`poll_canonical_head`]: ztreamer_indexer::head::poll_canonical_head
     async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
-        let Some(hash) = self.block_hash(height).await? else {
-            return Ok(None);
-        };
-        let bytes = match self.node.get_block_raw(HashOrHeight::Hash(hash)).await {
+        let bytes = match self.node.get_block_raw(HashOrHeight::Height(block::Height(height))).await
+        {
             Ok(bytes) => bytes.0,
-            Err(error) if error.is_block_not_found() => return Err(HeadError::Changed),
+            Err(error) if error.is_block_not_found() => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let block = RawIndexBlock::from_bytes(bytes)
+        let block = tokio::task::spawn_blocking(move || RawIndexBlock::from_bytes(bytes))
+            .await
+            .unwrap_or_else(|error| panic::resume_unwind(error.into_panic()))
             .map_err(|error| HeadError::Decode(error.to_string()))?;
         if block.height.0 != height {
             return Err(HeadError::Height { expected: height, actual: block.height.0 });
-        }
-        if block.hash != hash {
-            return Err(HeadError::Hash { height, expected: hash, actual: block.hash });
         }
         Ok(Some(block))
     }
@@ -161,36 +161,11 @@ mod tests {
     async fn a_height_above_the_tip_of_the_node_is_no_block() {
         let blocks = chain(5);
         let chain = MockChain::new(&blocks);
-        // A different error with the same code as the error for a height above the tip.
-        let mock = MockNode::start(move |_, request| match request.body["params"][0].as_u64() {
-            Some(7) => Reply::Error { code: RpcCode::MISC, message: "Invalid params" },
-            _ => chain.reply(request),
-        })
-        .await;
-        let mut source =
-            RemoteHeadSource::new(ZakuraClient::new(RpcClient::new(mock.config()).unwrap()));
-
-        assert!(source.block(5).await.unwrap().is_some());
-        assert!(source.block(6).await.unwrap().is_none());
-        assert!(matches!(source.block(7).await, Err(HeadError::Remote(_))));
-    }
-
-    #[tokio::test]
-    async fn a_block_with_another_hash_is_refused() {
-        let blocks = chain(5);
-        let mut fork = blocks[..3].to_vec();
-        grow_chain(&mut fork, 3, 1);
-        let named = fork[3].hash();
-        let sent = blocks[3].clone();
-        let chain = MockChain::new(&blocks);
-        // The node names the hash of the fork block at height 3, then sends the block of the best
-        // chain for that hash.
+        // This error has the code of the `getblockhash` error above the tip, with another message.
         let mock = MockNode::start(move |_, request| {
-            let params = &request.body["params"];
-            match request.body["method"].as_str() {
-                Some("getblockhash") if params[0] == 3 => Reply::Result(json!(named.to_string())),
-                Some("getblock") if params[0] == named.to_string().as_str() => {
-                    Reply::Result(json!(hex::encode(sent.zcash_serialize_to_vec().unwrap())))
+            match (request.body["method"].as_str(), request.body["params"][0].as_u64()) {
+                (Some("getblockhash"), Some(7)) => {
+                    Reply::Error { code: RpcCode::MISC, message: "Invalid params" }
                 }
                 _ => chain.reply(request),
             }
@@ -199,16 +174,29 @@ mod tests {
         let mut source =
             RemoteHeadSource::new(ZakuraClient::new(RpcClient::new(mock.config()).unwrap()));
 
+        assert!(source.block(5).await.unwrap().is_some());
+        assert!(source.block(6).await.unwrap().is_none());
+        assert_eq!(source.block_hash(5).await.unwrap(), Some(blocks[5].hash()));
+        assert_eq!(source.block_hash(6).await.unwrap(), None);
+        assert!(matches!(source.block_hash(7).await, Err(HeadError::Remote(_))));
+    }
+
+    #[tokio::test]
+    async fn a_block_at_another_height_is_refused() {
+        let blocks = chain(5);
+        let sent = blocks[4].clone();
+        let chain = MockChain::new(&blocks);
+        let mock = MockNode::start(move |_, request| match request.body["params"][0].as_str() {
+            Some("3") => Reply::Result(json!(hex::encode(sent.zcash_serialize_to_vec().unwrap()))),
+            _ => chain.reply(request),
+        })
+        .await;
+        let mut source =
+            RemoteHeadSource::new(ZakuraClient::new(RpcClient::new(mock.config()).unwrap()));
+
         let result = source.block(3).await;
 
-        assert!(
-            matches!(
-                result,
-                Err(HeadError::Hash { height: 3, expected, actual })
-                    if expected == fork[3].hash() && actual == blocks[3].hash()
-            ),
-            "{result:?}"
-        );
+        assert!(matches!(result, Err(HeadError::Height { expected: 3, actual: 4 })), "{result:?}");
         assert!(source.block(4).await.unwrap().is_some());
     }
 
@@ -318,10 +306,10 @@ mod tests {
             let before = mock.seen().len();
             service.sync_head(&mut source, PipelineConfig::default()).await.unwrap();
 
-            // One `getblockchaininfo`, one `getblockhash` each for the anchor, the old tip, the
-            // height above the new tip, and the re-check of the new tip, then one `getblockhash`
-            // and one `getblock` for each new block.
-            assert_eq!(requests_since(&mock, before), (5 + 2 * new, new));
+            // The poll sends one `getblockchaininfo` and three `getblockhash`: the anchor, the old
+            // tip and the re-check of the new tip. It sends one `getblock` for each new block and
+            // one `getblock` for the height above the new tip.
+            assert_eq!(requests_since(&mock, before), (5 + new, new + 1));
             assert_eq!(visible_tip(&service), Some(id(&blocks[tip as usize])));
         }
     }

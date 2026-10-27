@@ -21,7 +21,7 @@ use zakura_state::HashOrHeight;
 use ztreamer_indexer::{
     codec::RangeDecoder, index::RANGE_SIZE, parser::parse_block, types::RawIndexBlock,
 };
-use ztreamer_remote::ZakuraClient;
+use ztreamer_remote::{FirstBlockWithBody as _, ZakuraClient};
 
 use crate::{
     attest::{EpochError, NodeError},
@@ -181,8 +181,7 @@ impl JsonRpcSampler {
 
     /// Reads the prune height of the node, keeps it if it is higher, and returns it.
     async fn refresh_prune_height(&self) -> Result<u32, NodeError> {
-        let info = self.node.get_blockchain_info().await?;
-        let height = info.prune_height().map_or(0, |height| height.0);
+        let height = self.node.get_blockchain_info().await?.first_block_with_body().0;
         Ok(self.prune_height.fetch_max(height, Ordering::Relaxed).max(height))
     }
 

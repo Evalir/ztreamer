@@ -204,6 +204,13 @@ impl RpcError {
         self.rpc_code() == Some(RpcCode::INVALID_PARAMETER) || self.is_height_above_tip()
     }
 
+    /// True when the node has no transaction with the requested id, in its mempool or in its
+    /// best chain. zakura answers `getrawtransaction` for a missing transaction with
+    /// [`RpcCode::INVALID_ADDRESS_OR_KEY`].
+    pub fn is_transaction_not_found(&self) -> bool {
+        self.rpc_code() == Some(RpcCode::INVALID_ADDRESS_OR_KEY)
+    }
+
     /// True when the node refused a height above its tip.
     ///
     /// zakura raises this error with [`RpcCode::INVALID_PARAMS`], and its middleware sends it
@@ -229,9 +236,10 @@ impl RpcError {
 
     /// True when the same request may succeed if sent again.
     ///
-    /// Every call the client makes is idempotent on the node, so a retry can never double an
-    /// effect. What it must not do is retry an answer that will not change: a node error other
-    /// than warm-up, a bad request, a decode failure.
+    /// Every call except `sendrawtransaction` is idempotent on the node. `sendrawtransaction`
+    /// retries only a failure where the request did not reach the node ([`Self::is_unsent`]).
+    /// No call retries an answer that will not change: a node error other than warm-up, a bad
+    /// request, a decode failure.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { .. } | Self::ConnectionClosed { .. } | Self::Timeout { .. } => true,
@@ -296,6 +304,9 @@ mod tests {
         );
         assert!(!rpc(RpcCode::IN_WARMUP).is_block_not_found());
         assert!(!http(StatusCode::NOT_FOUND).is_block_not_found());
+        assert!(rpc(RpcCode::INVALID_ADDRESS_OR_KEY).is_transaction_not_found());
+        assert!(!rpc(RpcCode::INVALID_PARAMETER).is_transaction_not_found());
+        assert!(!rpc(RpcCode::INVALID_ADDRESS_OR_KEY).is_block_not_found());
         assert!(
             RpcError::Timeout { method: "m".into(), timeout: Duration::from_secs(1) }
                 .is_retryable()

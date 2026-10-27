@@ -7,7 +7,10 @@ use std::{
 use clap::Parser;
 use serde_json::json;
 use tokio::{task::JoinHandle, time::timeout};
-use zakura_chain::{block::Block, serialization::ZcashDeserializeInto as _};
+use zakura_chain::{
+    block::{Block, Height},
+    serialization::ZcashDeserializeInto as _,
+};
 use zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES;
 use ztreamer_indexer::{index::SEAL_DEPTH, test_utils::grow_chain};
 use ztreamer_protocol::proto::{

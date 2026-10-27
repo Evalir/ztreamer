@@ -9,7 +9,7 @@ use http::Uri;
 use serde::{Serialize, de::DeserializeOwned};
 use zakura_rpc::{
     client::{
-        BlockObject, GetAddressBalanceRequest, GetAddressBalanceResponse, GetAddressTxIdsRequest,
+        GetAddressBalanceRequest, GetAddressBalanceResponse, GetAddressTxIdsRequest,
         GetAddressUtxosResponse, GetBlockHashResponse, GetBlockchainInfoResponse,
         GetRawMempoolResponse, GetRawTransactionResponse, GetSubtreesByIndexResponse,
         GetTreestateResponse, HexData, SendRawTransactionResponse,
@@ -19,7 +19,7 @@ use zakura_rpc::{
 };
 use zakura_state::HashOrHeight;
 
-use crate::{CallOptions, RpcClient, RpcConfig, RpcError};
+use crate::{RpcClient, RpcConfig, RpcError, client::Retries};
 
 /// A zakura JSON-RPC method that [`ZakuraClient`] calls.
 ///
@@ -118,6 +118,23 @@ pub const DEFAULT_METHOD_TIMEOUTS: [(Method, Duration); 7] = [
     (Method::GetAddressUtxos, Duration::from_secs(60)),
 ];
 
+/// The lowest height whose block body a node keeps, from its `getblockchaininfo` answer.
+///
+/// # Implementation guide
+///
+/// Only [`GetBlockchainInfoResponse`] implements it. A node that prunes keeps the bodies from
+/// its `pruneheight`. A node that does not prune keeps all bodies, from genesis.
+pub trait FirstBlockWithBody {
+    /// The lowest height whose block body the node keeps.
+    fn first_block_with_body(&self) -> block::Height;
+}
+
+impl FirstBlockWithBody for GetBlockchainInfoResponse {
+    fn first_block_with_body(&self) -> block::Height {
+        self.prune_height().unwrap_or(block::Height::MIN)
+    }
+}
+
 /// Typed calls to one zakura node, on an [`RpcClient`].
 ///
 /// ```no_run
@@ -193,12 +210,6 @@ impl ZakuraClient {
         self.call(Method::GetBlock, (block.to_string(), 0)).await
     }
 
-    /// `getblock` with verbosity 1: the block header fields, the tree roots and the
-    /// transaction ids.
-    pub async fn get_block(&self, block: HashOrHeight) -> Result<BlockObject, RpcError> {
-        self.call(Method::GetBlock, (block.to_string(), 1)).await
-    }
-
     /// `z_gettreestate`: the note commitment tree states after `block`.
     pub async fn z_get_treestate(
         &self,
@@ -228,32 +239,26 @@ impl ZakuraClient {
         self.call(Method::GetRawMempool, (false,)).await
     }
 
-    /// `getrawtransaction`: a mempool or best-chain transaction.
-    ///
-    /// With `verbose` false, the node returns the serialized transaction. With `verbose` true,
-    /// the node also returns the decoded fields and the block height.
+    /// `getrawtransaction` with verbose 1: a mempool or best-chain transaction, its decoded
+    /// fields and, for a mined transaction, its block height.
     pub async fn get_raw_transaction(
         &self,
         txid: transaction::Hash,
-        verbose: bool,
     ) -> Result<GetRawTransactionResponse, RpcError> {
-        self.call(Method::GetRawTransaction, (txid.to_string(), u8::from(verbose))).await
+        self.call(Method::GetRawTransaction, (txid.to_string(), 1)).await
     }
 
     /// `sendrawtransaction`: sends a serialized transaction to the mempool of the node.
     ///
     /// This call retries only when the request did not reach the node
-    /// ([`CallOptions::unsent_retries`]). After a timeout, the node can have the transaction
-    /// already, and a second attempt then gets the error "transaction already exists in
-    /// mempool".
+    /// ([`RpcError::is_unsent`]). After a timeout, the node can have the transaction already,
+    /// and a second attempt then gets the error "transaction already exists in mempool".
     pub async fn send_raw_transaction(
         &self,
         transaction: &[u8],
     ) -> Result<SendRawTransactionResponse, RpcError> {
         let params = (HexData(transaction.to_vec()),);
-        self.rpc
-            .call_with(Method::SendRawTransaction.name(), params, CallOptions::unsent_retries())
-            .await
+        self.rpc.call_with(Method::SendRawTransaction.name(), params, Retries::Unsent).await
     }
 
     /// `getaddresstxids`: the ids of the transactions that touch the addresses.
@@ -293,6 +298,21 @@ mod tests {
             assert_eq!(rpc.timeout_for(method.name()), timeout, "{method}");
         }
         assert_eq!(rpc.timeout_for("getbestblockhash"), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn first_block_with_body_is_the_prune_height_or_genesis() {
+        let mut info: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/getblockchaininfo.json")).unwrap();
+        let first = |info: &serde_json::Value| {
+            serde_json::from_value::<GetBlockchainInfoResponse>(info.clone())
+                .unwrap()
+                .first_block_with_body()
+        };
+        assert_eq!(first(&info), block::Height::MIN);
+        info["pruned"] = true.into();
+        info["pruneheight"] = 40.into();
+        assert_eq!(first(&info), block::Height(40));
     }
 
     #[test]

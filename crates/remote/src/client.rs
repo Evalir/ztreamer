@@ -30,6 +30,9 @@ use crate::{Auth, RpcError, envelope};
 /// How many bytes of an unexpected HTTP body end up in the error message.
 const ERROR_BODY_PREVIEW: usize = 512;
 
+/// The TCP connect timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Backoff and attempt limits for retryable failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -72,8 +75,6 @@ pub struct RpcConfig {
     auth: Auth,
     /// Extra PEM CA certificates to trust besides the web PKI roots.
     tls_ca_file: Option<PathBuf>,
-    /// TCP connect timeout.
-    connect_timeout: Duration,
     /// Timeout for a method without an entry in `method_timeouts`.
     default_timeout: Duration,
     /// Per-method timeouts. Slow methods such as `z_gettreestate` go here.
@@ -89,7 +90,6 @@ impl RpcConfig {
             url,
             auth: Auth::None,
             tls_ca_file: None,
-            connect_timeout: Duration::from_secs(5),
             default_timeout: Duration::from_secs(15),
             method_timeouts: HashMap::new(),
             retry: RetryPolicy::default(),
@@ -113,12 +113,6 @@ impl RpcConfig {
         self
     }
 
-    /// Sets the TCP connect timeout.
-    pub const fn with_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
-        self
-    }
-
     /// Sets the timeout used by methods without their own entry.
     pub const fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = timeout;
@@ -138,28 +132,14 @@ impl RpcConfig {
     }
 }
 
-/// Overrides for a single call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CallOptions {
-    /// Replaces the method's configured timeout.
-    pub timeout: Option<Duration>,
-    /// Replaces the configured retry count.
-    pub max_retries: Option<u32>,
+/// The failures that a call retries, up to the retry count of the [`RetryPolicy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retries {
+    /// Retries the failures that [`RpcError::is_retryable`] accepts.
+    Retryable,
     /// Retries only a failure where the request did not reach the node
     /// ([`RpcError::is_unsent`]). Use this for a call that must not run twice on the node.
-    pub unsent_only: bool,
-}
-
-impl CallOptions {
-    /// One attempt, no retries.
-    pub const fn no_retry() -> Self {
-        Self { timeout: None, max_retries: Some(0), unsent_only: false }
-    }
-
-    /// Retries, but only when the request did not reach the node.
-    pub const fn unsent_retries() -> Self {
-        Self { timeout: None, max_retries: None, unsent_only: true }
-    }
+    Unsent,
 }
 
 type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -210,7 +190,7 @@ impl RpcClient {
         }
 
         let auth_header = config.auth.header()?;
-        let http = build_http_client(config.tls_ca_file.as_deref(), config.connect_timeout)?;
+        let http = build_http_client(config.tls_ca_file.as_deref())?;
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -231,7 +211,7 @@ impl RpcClient {
         &self.inner.uri
     }
 
-    /// The timeout a call to `method` gets without per-call overrides.
+    /// The timeout of a call to `method`.
     pub fn timeout_for(&self, method: &str) -> Duration {
         self.inner.method_timeouts.get(method).copied().unwrap_or(self.inner.default_timeout)
     }
@@ -245,15 +225,15 @@ impl RpcClient {
         P: Serialize,
         R: DeserializeOwned,
     {
-        self.call_with(method, params, CallOptions::default()).await
+        self.call_with(method, params, Retries::Retryable).await
     }
 
-    /// [`Self::call`] with per-call timeout and retry overrides.
-    pub async fn call_with<P, R>(
+    /// Calls `method` as [`Self::call`] does, but retries only the failures in `retries`.
+    pub(crate) async fn call_with<P, R>(
         &self,
         method: &str,
         params: P,
-        options: CallOptions,
+        retries: Retries,
     ) -> Result<R, RpcError>
     where
         P: Serialize,
@@ -270,22 +250,22 @@ impl RpcClient {
                 });
             }
         };
-        let value = self.call_value(method, params, options).await?;
+        let value = self.call_value(method, params, retries).await?;
         serde_json::from_value(value)
             .map_err(|source| RpcError::Decode { method: method.to_owned(), source })
     }
 
     /// Calls `method` and returns the raw `result` value.
-    pub async fn call_value(
+    async fn call_value(
         &self,
         method: &str,
         params: Value,
-        options: CallOptions,
+        retries: Retries,
     ) -> Result<Value, RpcError> {
-        let timeout = options.timeout.unwrap_or_else(|| self.timeout_for(method));
-        let max_retries = options.max_retries.unwrap_or(self.inner.retry.max_retries);
+        let timeout = self.timeout_for(method);
+        let max_retries = self.inner.retry.max_retries;
 
-        let mut retries = 0;
+        let mut retry_count = 0;
         let mut reloaded_cookie = false;
         loop {
             let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
@@ -316,13 +296,16 @@ impl RpcClient {
                 }
             }
 
-            let retry = if options.unsent_only { error.is_unsent() } else { error.is_retryable() };
-            if retry && retries < max_retries {
-                let wait = self.inner.retry.backoff(retries);
-                retries += 1;
+            let retry = match retries {
+                Retries::Retryable => error.is_retryable(),
+                Retries::Unsent => error.is_unsent(),
+            };
+            if retry && retry_count < max_retries {
+                let wait = self.inner.retry.backoff(retry_count);
+                retry_count += 1;
                 tracing::debug!(
                     method,
-                    retry = retries,
+                    retry = retry_count,
                     max_retries,
                     ?wait,
                     %error,
@@ -428,10 +411,7 @@ fn preview(body: &[u8]) -> String {
     text[..end].to_owned()
 }
 
-fn build_http_client(
-    ca_file: Option<&std::path::Path>,
-    connect_timeout: Duration,
-) -> Result<HttpClient, RpcError> {
+fn build_http_client(ca_file: Option<&std::path::Path>) -> Result<HttpClient, RpcError> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(path) = ca_file {
@@ -466,7 +446,7 @@ fn build_http_client(
 
     let mut tcp = HttpConnector::new();
     tcp.enforce_http(false);
-    tcp.set_connect_timeout(Some(connect_timeout));
+    tcp.set_connect_timeout(Some(CONNECT_TIMEOUT));
     tcp.set_nodelay(true);
     let https = HttpsConnectorBuilder::new()
         .with_tls_config(tls)

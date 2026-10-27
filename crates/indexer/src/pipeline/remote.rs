@@ -8,13 +8,13 @@ use tokio::{
 };
 use zakura_chain::block::{self, Height};
 use zakura_state::HashOrHeight;
-use ztreamer_remote::{Method, RpcError, ZakuraClient};
+use ztreamer_remote::{FirstBlockWithBody as _, Method, RpcError, ZakuraClient};
 
 use super::{HistoricalSource, PipelineError, WorkerStats, flow_control::SegmentSender};
 use crate::{index::SEAL_DEPTH, parser::parse_block, types::RawIndexBlock};
 
-/// The `getblock` requests that one worker keeps in flight when it does not set another value.
-pub const DEFAULT_REQUESTS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+/// The number of `getblock` requests that one worker keeps in flight.
+const REQUESTS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 /// The chain of a remote zakura node below the head, read over JSON-RPC.
 ///
@@ -35,11 +35,12 @@ pub const DEFAULT_REQUESTS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(8).unwrap
 /// - Run the pipeline on a blocking thread, for example in `tokio::task::spawn_blocking` or on a
 ///   `std::thread`, never in an async task. [`Handle::block_on`] panics in an async context.
 ///
-/// [`HistoricalSource::process_segment`] spawns the `getblock` requests on the runtime, up to
-/// [`Self::with_requests_in_flight`] ahead of the block that the worker waits for. The requests
-/// continue while the worker parses and sends a block, and while it waits for read-ahead budget.
-/// The node thus gets up to [`PipelineConfig::workers`](super::PipelineConfig::workers) times
-/// this number of `getblock` requests at the same time.
+/// [`HistoricalSource::process_segment`] spawns the `getblock` requests on the runtime. Each
+/// worker keeps a fixed number of requests in flight ahead of the block that it waits for. The
+/// requests continue while the worker parses and sends a block, and while it waits for
+/// read-ahead budget. The node thus gets up to
+/// [`PipelineConfig::workers`](super::PipelineConfig::workers) times that number of `getblock`
+/// requests at the same time.
 ///
 /// ```no_run
 /// use ztreamer_indexer::pipeline::{HistoricalPipeline, PipelineConfig, RemoteTailSource};
@@ -68,14 +69,7 @@ pub struct RemoteTailSource {
 impl RemoteTailSource {
     /// A source that reads from `node` with requests on `runtime`.
     pub const fn new(node: ZakuraClient, runtime: Handle) -> Self {
-        Self { node, runtime, requests_in_flight: DEFAULT_REQUESTS_IN_FLIGHT }
-    }
-
-    /// Sets the number of `getblock` requests that each worker keeps in flight. The default is
-    /// [`DEFAULT_REQUESTS_IN_FLIGHT`].
-    pub const fn with_requests_in_flight(mut self, requests: NonZeroUsize) -> Self {
-        self.requests_in_flight = requests;
-        self
+        Self { node, runtime, requests_in_flight: REQUESTS_IN_FLIGHT }
     }
 
     async fn tail_tip(&self) -> Result<(Height, block::Hash), RpcError> {
@@ -117,7 +111,7 @@ impl HistoricalSource for RemoteTailSource {
     /// The `pruneheight` field of `getblockchaininfo`. Zero when the node does not prune.
     fn prune_height(&self) -> Result<u32, PipelineError> {
         let info = self.runtime.block_on(self.node.get_blockchain_info())?;
-        Ok(info.prune_height().map_or(0, |height| height.0))
+        Ok(info.first_block_with_body().0)
     }
 
     fn process_segment(
@@ -353,8 +347,8 @@ mod tests {
     fn block_requests_give_each_height_in_order_then_end() {
         let runtime = runtime();
         let blocks = chain(20);
-        let (_mock, source) = node(&runtime, serve(&MockChain::new(&blocks)));
-        let source = source.with_requests_in_flight(NonZeroUsize::new(2).unwrap());
+        let (_mock, mut source) = node(&runtime, serve(&MockChain::new(&blocks)));
+        source.requests_in_flight = NonZeroUsize::new(2).unwrap();
 
         let fetched: Vec<_> = BlockRequests::new(&source, 10..=14)
             .map(|(height, bytes)| (height, bytes.unwrap()))

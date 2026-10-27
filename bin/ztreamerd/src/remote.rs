@@ -26,10 +26,10 @@ use ztreamer_indexer::{
     index::{BlockId, Index},
     pipeline::RemoteTailSource,
 };
-use ztreamer_remote::{Auth, RpcClient, RpcCode, Secret, ZakuraClient};
+use ztreamer_remote::{Auth, FirstBlockWithBody as _, RpcClient, RpcCode, Secret, ZakuraClient};
 use ztreamer_service::remote::{RemoteBackend, RemoteHeadSource};
 
-use crate::{DaemonArgs, NodeSources, Readiness, lifecycle, replicate::Replica, run_application};
+use crate::{DaemonArgs, NodeSources, lifecycle, replicate::Replica, run_application};
 
 /// The time between two `getblockchaininfo` calls while the remote node is not ready.
 const READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -321,14 +321,6 @@ impl RemoteNode {
     }
 }
 
-impl Readiness for RemoteSources {
-    /// Ready at once: [`RemoteNode`] makes these sources only when the node is ready for the
-    /// index.
-    async fn wait_ready(&self, _shutdown: &CancellationToken) -> Result<ControlFlow<()>> {
-        Ok(ControlFlow::Continue(()))
-    }
-}
-
 /// The chain name that a zakura node gives in `getblockchaininfo`. [`Network::try_from`] maps it
 /// to the network of the node.
 #[derive(Clone, Copy, Debug)]
@@ -385,14 +377,16 @@ impl IndexTip {
     /// the head follower read the blocks above the tip, thus the first of them must be at or
     /// above the prune height of the node.
     fn served_by(self, info: &GetBlockchainInfoResponse) -> Result<bool> {
-        let next = self.0.map_or(0, |tip| tip.height.saturating_add(1));
-        let prune_height = info.prune_height().unwrap_or(Height::MIN).0;
-        if next < prune_height {
+        let next = Height(self.0.map_or(0, |tip| tip.height.saturating_add(1)));
+        let first = info.first_block_with_body();
+        if next < first {
             return Err(eyre!(
-                "the index needs block {next}, but the remote zakura node keeps block bodies \
-                 only from height {prune_height}: use a node that keeps these blocks, or an \
-                 index with a tip at or above {}",
-                prune_height - 1
+                "the index needs block {}, but the remote zakura node keeps block bodies only \
+                 from height {}: use a node that keeps these blocks, or an index with a tip at \
+                 or above {}",
+                next.0,
+                first.0,
+                first.0 - 1
             ));
         }
         Ok(self.0.is_none_or(|tip| info.blocks().0 >= tip.height))

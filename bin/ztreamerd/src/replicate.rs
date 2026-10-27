@@ -18,10 +18,10 @@ use http::Uri;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-use zakura_chain::parameters::Network;
+use zakura_chain::{block::Height, parameters::Network};
 use zakura_rpc::client::GetBlockchainInfoResponse;
 use ztreamer_indexer::index::{Index, range_meta::NodeId};
-use ztreamer_remote::ZakuraClient;
+use ztreamer_remote::{FirstBlockWithBody as _, ZakuraClient};
 use ztreamer_service::RemoteBackend;
 use ztreamer_verify::{
     attest::JsonRpcAttestor,
@@ -149,14 +149,16 @@ impl Replica {
         };
         // The tail, the samples and the tree states of zakura v1.5.1 (zakura-core/zakura#1725)
         // need the blocks from the next block on.
-        let next = sealed.map_or(0, |sealed| sealed + 1);
-        let prune_height = info.prune_height().map_or(0, |height| height.0);
+        let next = Height(sealed.map_or(0, |sealed| sealed + 1));
+        let first = info.first_block_with_body();
         ensure!(
-            next >= prune_height,
-            "the import needs block {next}, but the remote zakura node keeps block bodies only \
-             from height {prune_height}: use a node that does not prune, or an index that is \
-             sealed through height {} or above",
-            prune_height - 1
+            next >= first,
+            "the import needs block {}, but the remote zakura node keeps block bodies only from \
+             height {}: use a node that does not prune, or an index that is sealed through \
+             height {} or above",
+            next.0,
+            first.0,
+            first.0 - 1
         );
 
         let mut sources = Vec::with_capacity(self.sources.len());

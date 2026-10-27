@@ -17,7 +17,7 @@ mod telemetry;
 mod zakura;
 pub use flow_control::SegmentSender;
 use flow_control::{ReadAheadReceiver, ReadAheadSender};
-pub use remote::{DEFAULT_REQUESTS_IN_FLIGHT, RemoteTailSource};
+pub use remote::RemoteTailSource;
 use telemetry::{PipelineMetrics, SegmentMetrics};
 
 use zakura_chain::block::{self, Height};

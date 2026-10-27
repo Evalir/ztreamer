@@ -97,17 +97,6 @@ async fn get_block_raw() {
 }
 
 #[tokio::test]
-async fn get_block_by_hash() {
-    let (mock, node) = node(vector(include_str!("vectors/getblock_verbosity_1.json"))).await;
-    let hash: block::Hash = BLOCK_HASH.parse().unwrap();
-    let block = node.get_block(HashOrHeight::Hash(hash)).await.unwrap();
-    assert_eq!(block.hash(), hash);
-    assert_eq!(block.height(), Some(block::Height(2222000)));
-    assert_eq!(block.tx().len(), 2);
-    assert_eq!(sent(&mock), ("getblock".into(), json!([BLOCK_HASH, 1])));
-}
-
-#[tokio::test]
 async fn z_get_treestate() {
     let (mock, node) = node(vector(include_str!("vectors/z_gettreestate.json"))).await;
     let treestate =
@@ -161,7 +150,7 @@ async fn get_raw_transaction_verbose() {
     let (mock, node) = node(response).await;
     let txid: transaction::Hash = TXID.parse().unwrap();
     let GetRawTransactionResponse::Object(transaction) =
-        node.get_raw_transaction(txid, true).await.unwrap()
+        node.get_raw_transaction(txid).await.unwrap()
     else {
         panic!("expected a transaction object");
     };

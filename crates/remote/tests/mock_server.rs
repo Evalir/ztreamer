@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use ztreamer_remote::{
-    Auth, CallOptions, RetryPolicy, RpcClient, RpcCode, RpcConfig, RpcError, ZakuraClient,
+    Auth, RetryPolicy, RpcClient, RpcCode, RpcConfig, RpcError, ZakuraClient,
     test_utils::{MockNode, Reply},
 };
 
@@ -145,38 +145,6 @@ async fn method_timeout_overrides_default() {
         }
         other => panic!("unexpected {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn call_options_override_timeout_and_retries() {
-    let mock = MockNode::start(|_, _| {
-        Reply::Delay(Duration::from_millis(100), Box::new(Reply::Result(json!(1))))
-    })
-    .await;
-    let client = RpcClient::new(
-        mock.config().with_default_timeout(Duration::from_millis(20)).with_retry(fast_retries(5)),
-    )
-    .unwrap();
-
-    // Per-call timeout long enough: succeeds on the first attempt.
-    let value: u32 = client
-        .call_with(
-            "getblock",
-            ("1",),
-            CallOptions { timeout: Some(Duration::from_secs(2)), ..CallOptions::default() },
-        )
-        .await
-        .unwrap();
-    assert_eq!(value, 1);
-    assert_eq!(mock.seen().len(), 1);
-
-    // Default timeout too short and retries disabled per call: one attempt, one timeout.
-    let error = client
-        .call_with::<_, Value>("getblock", ("1",), CallOptions::no_retry())
-        .await
-        .unwrap_err();
-    assert!(matches!(error, RpcError::Timeout { .. }));
-    assert_eq!(mock.seen().len(), 2);
 }
 
 #[tokio::test]
