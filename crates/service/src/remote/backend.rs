@@ -12,13 +12,11 @@ use std::{
     mem::size_of,
     ops::RangeInclusive,
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
 };
 
 use futures_util::{StreamExt as _, TryStreamExt as _, future, stream};
 use lru::LruCache;
 use sapling_crypto::Node as SaplingNode;
-use tokio::sync::watch;
 use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block},
@@ -43,7 +41,7 @@ use ztreamer_indexer::frontier::FromRpc;
 use ztreamer_remote::{RpcCode, RpcError, ZakuraClient};
 
 use crate::backend::{
-    AddressUtxo, BackendError, MinedTransaction, StateBackend, Subtrees, TipListener, TreeState,
+    AddressUtxo, BackendError, MinedTransaction, StateBackend, Subtrees, TreeState,
 };
 
 /// The bytes that the tree-state cache can hold: approximately 4,000 tree states.
@@ -57,9 +55,6 @@ const MEMPOOL_FETCHES: usize = 16;
 /// serialized bytes. The cache keeps only the transactions of the latest `getrawmempool`
 /// answer, so it is normally smaller.
 const MEMPOOL_CACHE_BYTES: usize = 160 << 20;
-
-/// The default time between two `getbestblockhash` calls of the tip poller.
-const TIP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Why [`RemoteBackend::connect`] refused the node.
 #[derive(Debug, thiserror::Error)]
@@ -106,8 +101,7 @@ impl From<RpcError> for BackendError {
 /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = ZakuraClient::config("http://127.0.0.1:8232".parse()?);
 /// let node = ZakuraClient::new(RpcClient::new(config)?);
-/// let (backend, poller) = RemoteBackend::connect(node, Network::Mainnet).await?;
-/// tokio::spawn(poller.run());
+/// let backend = RemoteBackend::connect(node, Network::Mainnet).await?;
 /// # let _ = backend;
 /// # Ok(())
 /// # }
@@ -117,9 +111,6 @@ pub struct RemoteBackend {
     network: Network,
     tree_states: LruMap<block::Hash, TreeState>,
     mempool: LruMap<transaction::Hash, UnminedTx>,
-    /// The best block hash from the [`TipPoller`]. The poller stops when this receiver and
-    /// all tip listeners are dropped.
-    tip: watch::Receiver<BestHash>,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -134,13 +125,7 @@ impl std::fmt::Debug for RemoteBackend {
 impl RemoteBackend {
     /// Connects to the node and makes sure that it runs `network`: the chain name and the
     /// genesis hash must match.
-    ///
-    /// It also returns the [`TipPoller`] of the backend. Spawn [`TipPoller::run`]: without it,
-    /// no tip listener wakes.
-    pub async fn connect(
-        node: ZakuraClient,
-        network: Network,
-    ) -> Result<(Self, TipPoller), RemoteConnectError> {
+    pub async fn connect(node: ZakuraClient, network: Network) -> Result<Self, RemoteConnectError> {
         let (info, genesis) =
             tokio::try_join!(node.get_blockchain_info(), node.get_block_hash(block::Height(0)))?;
         let expected = network.bip70_network_name();
@@ -151,18 +136,12 @@ impl RemoteBackend {
         if found != expected {
             return Err(RemoteConnectError::WrongGenesis { expected, found });
         }
-        let best = info.best_block_hash();
-        let (sender, tip) = watch::channel(Ok(best));
-        let poller =
-            TipPoller { node: node.clone(), sender, last: best, interval: TIP_POLL_INTERVAL };
-        let backend = Self {
+        Ok(Self {
             node,
             network,
             tree_states: LruMap::new("tree_states", TREE_CACHE_BYTES),
             mempool: LruMap::new("mempool", MEMPOOL_CACHE_BYTES),
-            tip,
-        };
-        Ok((backend, poller))
+        })
     }
 
     /// Completed subtrees of `P` from `start`, at most `limit` of them.
@@ -255,67 +234,6 @@ impl FetchedTransaction {
             )));
         }
         Ok(transaction)
-    }
-}
-
-/// The best block hash or the last poll error, as the tip poller sees it.
-type BestHash = Result<block::Hash, BackendError>;
-
-/// Polls the best block hash for the tip listeners of one [`RemoteBackend`].
-///
-/// [`RemoteBackend::connect`] returns it. Spawn [`TipPoller::run`]: without it, no tip listener
-/// wakes.
-#[derive(Debug)]
-pub struct TipPoller {
-    node: ZakuraClient,
-    sender: watch::Sender<BestHash>,
-    last: block::Hash,
-    /// The time between two `getbestblockhash` calls: [`TIP_POLL_INTERVAL`].
-    interval: Duration,
-}
-
-impl TipPoller {
-    /// Calls `getbestblockhash` once per interval. It wakes the tip listeners when the hash
-    /// changes or a call fails. After a failure, a hash that is the same as before the failure
-    /// wakes nobody. It returns when the backend and all tip listeners are dropped.
-    pub async fn run(mut self) {
-        let mut interval = tokio::time::interval(self.interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                () = self.sender.closed() => return,
-                _ = interval.tick() => self.poll().await,
-            }
-        }
-    }
-
-    async fn poll(&mut self) {
-        match self.node.get_best_block_hash().await {
-            Ok(best) => {
-                let changed = best.hash() != self.last;
-                self.last = best.hash();
-                let last = self.last;
-                self.sender.send_if_modified(|value| {
-                    *value = Ok(last);
-                    changed
-                });
-            }
-            Err(error) => self.sender.send_modify(|value| *value = Err(error.into())),
-        }
-    }
-}
-
-/// Wakes when the tip poller sees a new best block hash or a failure.
-struct RemoteTipListener(watch::Receiver<BestHash>);
-
-#[tonic::async_trait]
-impl TipListener for RemoteTipListener {
-    async fn tip_changed(&mut self) -> Result<(), BackendError> {
-        self.0
-            .changed()
-            .await
-            .map_err(|_| BackendError::Unavailable("remote zakura tip poller stopped".into()))?;
-        self.0.borrow_and_update().clone().map(|_| ())
     }
 }
 
@@ -851,13 +769,6 @@ impl StateBackend for RemoteBackend {
             Err(error) => Err(error.into()),
         }
     }
-
-    fn tip_listener(&self) -> Result<Box<dyn TipListener>, BackendError> {
-        // A listener starts from the hash of now.
-        let mut receiver = self.tip.clone();
-        receiver.mark_unchanged();
-        Ok(Box::new(RemoteTipListener(receiver)))
-    }
 }
 
 #[cfg(test)]
@@ -876,11 +787,10 @@ mod tests {
     use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
     use ztreamer_remote::{
         RpcClient,
-        test_utils::{MockNode, Reply, Seen},
+        test_utils::{MockNode, Reply},
     };
 
-    /// The mainnet answers that `connect` and the tip reads need, for a node with tip `tip`
-    /// and best block hash zero.
+    /// The mainnet answers that `connect` and the tip reads need, for a node with tip `tip`.
     fn chain_reply(method: &str, tip: u32) -> Option<Reply> {
         Some(match method {
             "getblockchaininfo" => {
@@ -890,7 +800,6 @@ mod tests {
             }
             "getblockcount" => Reply::Result(json!(tip)),
             "getblockhash" => Reply::Result(json!(Network::Mainnet.genesis_hash().to_string())),
-            "getbestblockhash" => Reply::Result(json!(block::Hash([0; 32]).to_string())),
             _ => return None,
         })
     }
@@ -907,16 +816,9 @@ mod tests {
         .await
     }
 
-    /// The requests of the mock without the polls of the tip poller.
-    fn calls(mock: &MockNode) -> Vec<Seen> {
-        mock.seen().into_iter().filter(|seen| seen.body["method"] != "getbestblockhash").collect()
-    }
-
     async fn backend(mock: &MockNode) -> RemoteBackend {
         let node = ZakuraClient::new(RpcClient::new(mock.config()).unwrap());
-        let (backend, poller) = RemoteBackend::connect(node, Network::Mainnet).await.unwrap();
-        tokio::spawn(poller.run());
-        backend
+        RemoteBackend::connect(node, Network::Mainnet).await.unwrap()
     }
 
     fn block_1() -> Block {
@@ -931,8 +833,7 @@ mod tests {
     async fn connect_checks_the_network() {
         let mock = mainnet(1, |_, _| Reply::Close).await;
         let node = ZakuraClient::new(RpcClient::new(mock.config()).unwrap());
-        let (backend, _poller) =
-            RemoteBackend::connect(node.clone(), Network::Mainnet).await.unwrap();
+        let backend = RemoteBackend::connect(node.clone(), Network::Mainnet).await.unwrap();
         assert_eq!(backend.network(), Network::Mainnet);
         assert_eq!(backend.tip_height().await.unwrap(), Some(block::Height(1)));
 
@@ -1165,9 +1066,9 @@ mod tests {
         assert!(trees.ironwood.is_none());
         let cached = backend.tree_states.lock().bytes;
         assert!(cached > 0 && cached <= TREE_CACHE_BYTES, "{cached}");
-        let requests = calls(&mock).len();
+        let requests = mock.seen().len();
         assert_eq!(backend.tree_state(good).await.unwrap().orchard.unwrap().count(), 5);
-        assert_eq!(calls(&mock).len(), requests);
+        assert_eq!(mock.seen().len(), requests);
 
         for hash in [bad_root, block::Hash([3; 32])] {
             let error = backend.tree_state(hash).await.unwrap_err();
@@ -1183,7 +1084,7 @@ mod tests {
 
     /// The params of the last request of the mock.
     fn last_params(mock: &MockNode) -> Value {
-        calls(mock).last().unwrap().body["params"].clone()
+        mock.seen().last().unwrap().body["params"].clone()
     }
 
     #[tokio::test]
@@ -1209,14 +1110,14 @@ mod tests {
         let heights = block::Height(1)..=block::Height(5);
         assert_eq!(backend.address_transaction_ids(address(), heights).await.unwrap(), [txid]);
         assert_eq!(last_params(&mock), json!([{"addresses": [ADDRESS], "start": 1, "end": 5}]));
-        let requests = calls(&mock).len();
+        let requests = mock.seen().len();
         let genesis = block::Height(0)..=block::Height(0);
         assert!(backend.address_transaction_ids(address(), genesis).await.unwrap().is_empty());
-        assert_eq!(calls(&mock).len(), requests);
+        assert_eq!(mock.seen().len(), requests);
         // The tip of the mock is 1, so a range from 2 has no transactions.
         let above = block::Height(2)..=block::Height(9);
         assert!(backend.address_transaction_ids(address(), above).await.unwrap().is_empty());
-        assert_eq!(calls(&mock).last().unwrap().body["method"], "getblockcount");
+        assert_eq!(mock.seen().last().unwrap().body["method"], "getblockcount");
 
         let addresses = HashSet::from([address()]);
         assert_eq!(
@@ -1270,9 +1171,9 @@ mod tests {
         assert_eq!(ids(backend.mempool_transactions().await.unwrap()), [pending_id]);
 
         // The second read asks again only for the transactions that are not in the cache.
-        let requests = calls(&mock).len();
+        let requests = mock.seen().len();
         assert_eq!(ids(backend.mempool_transactions().await.unwrap()), [pending_id]);
-        let asked: HashSet<_> = calls(&mock)[requests..]
+        let asked: HashSet<_> = mock.seen()[requests..]
             .iter()
             .filter(|seen| seen.body["method"] == "getrawtransaction")
             .map(|seen| seen.body["params"][0].as_str().unwrap().to_owned())
@@ -1330,45 +1231,5 @@ mod tests {
             mainnet(1, |_, _| Reply::Error { code: RpcCode::IN_WARMUP, message: "warm-up" }).await;
         let error = backend(&mock).await.submit_transaction((*coinbase).clone()).await.unwrap_err();
         assert!(matches!(error, BackendError::Unavailable(_)), "{error}");
-    }
-
-    #[tokio::test]
-    async fn tip_listeners_wake_on_a_new_best_hash_only() {
-        let moved = Arc::new(AtomicBool::new(false));
-        let tip = moved.clone();
-        let mock = MockNode::start(move |_, seen| {
-            let method = seen.body["method"].as_str().unwrap();
-            match method {
-                "getbestblockhash" => {
-                    let hash = block::Hash([u8::from(tip.load(Ordering::SeqCst)); 32]);
-                    Reply::Result(json!(hash.to_string()))
-                }
-                _ => chain_reply(method, 1).unwrap(),
-            }
-        })
-        .await;
-        let node = ZakuraClient::new(RpcClient::new(mock.config()).unwrap());
-        let (backend, poller) = RemoteBackend::connect(node, Network::Mainnet).await.unwrap();
-        // A short interval keeps the test fast. Each wait covers several polls.
-        let interval = Duration::from_millis(10);
-        let poller = tokio::spawn(TipPoller { interval, ..poller }.run());
-        let wait = 20 * interval;
-        let polls =
-            || mock.seen().iter().filter(|seen| seen.body["method"] == "getbestblockhash").count();
-
-        // The poller gives the same hash as at connect, so nothing wakes.
-        let mut first = backend.tip_listener().unwrap();
-        assert!(tokio::time::timeout(wait, first.tip_changed()).await.is_err());
-        assert!(polls() > 0);
-        moved.store(true, Ordering::SeqCst);
-        tokio::time::timeout(2 * wait, first.tip_changed()).await.unwrap().unwrap();
-
-        // A listener made after the change starts from the new hash.
-        let mut late = backend.tip_listener().unwrap();
-        assert!(tokio::time::timeout(wait, late.tip_changed()).await.is_err());
-
-        // The poller returns when the backend and the listeners are gone.
-        drop((backend, first, late));
-        tokio::time::timeout(2 * wait, poller).await.unwrap().unwrap();
     }
 }

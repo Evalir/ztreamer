@@ -29,7 +29,7 @@ use zakura_chain::{
     transaction::{self, Transaction, UnminedTx},
     transparent,
 };
-use zakura_state::{ChainTipChange, ReadRequest, ReadResponse, ReadStateService};
+use zakura_state::{ReadRequest, ReadResponse, ReadStateService};
 use ztreamer_node::NodeClient;
 
 /// Why a backend request failed. Each variant maps to one gRPC status code.
@@ -100,14 +100,6 @@ pub struct AddressUtxo {
     pub output: transparent::Output,
     /// The height the transaction was mined at.
     pub height: block::Height,
-}
-
-/// Wakes when the best chain tip changes. Streams that must restart at a new tip, such as the
-/// mempool stream, wait on this.
-#[tonic::async_trait]
-pub trait TipListener: Send {
-    /// Resolves once the tip has changed since the listener was created or last resolved.
-    async fn tip_changed(&mut self) -> Result<(), BackendError>;
 }
 
 /// Chain state and node access for the service, behind one interface.
@@ -183,9 +175,6 @@ pub trait StateBackend: Send + Sync + 'static {
         &self,
         transaction: Transaction,
     ) -> Result<transaction::Hash, BackendError>;
-
-    /// A new listener for best tip changes, starting from the tip as of now.
-    fn tip_listener(&self) -> Result<Box<dyn TipListener>, BackendError>;
 }
 
 /// The embedded Zakura node, reached in-process.
@@ -408,23 +397,6 @@ impl StateBackend for InProcessBackend {
             BackendError::Rejected(format!("Zakura rejected transaction: {error}"))
         })
     }
-
-    fn tip_listener(&self) -> Result<Box<dyn TipListener>, BackendError> {
-        let mut changes = self.node()?.subscribe_chain_tip();
-        let _ = changes.last_tip_change();
-        Ok(Box::new(InProcessTipListener(changes)))
-    }
-}
-
-struct InProcessTipListener(ChainTipChange);
-
-#[tonic::async_trait]
-impl TipListener for InProcessTipListener {
-    async fn tip_changed(&mut self) -> Result<(), BackendError> {
-        self.0.wait_for_tip_change().await.map(|_| ()).map_err(|error| {
-            BackendError::Unavailable(format!("Zakura chain-tip listener failed: {error}"))
-        })
-    }
 }
 
 #[cfg(test)]
@@ -467,7 +439,6 @@ mod tests {
                 error,
                 BackendError::Unavailable("embedded Zakura node handle is unavailable".into())
             );
-            assert!(backend.tip_listener().is_err());
         });
     }
 }

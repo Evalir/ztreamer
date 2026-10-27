@@ -261,7 +261,7 @@ impl RemoteNode {
         index: &Arc<Index>,
         shutdown: &CancellationToken,
     ) -> Result<ControlFlow<(), RemoteSources>> {
-        let (backend, poller) = RemoteBackend::connect(self.client.clone(), network.clone())
+        let backend = RemoteBackend::connect(self.client.clone(), network.clone())
             .await
             .wrap_err("connect to the remote zakura node")?;
         let tip = IndexTip::read(index).await?;
@@ -281,7 +281,6 @@ impl RemoteNode {
             info = next;
         }
         info!(best = info.blocks().0, "remote zakura is ready");
-        tokio::spawn(poller.run());
         Ok(ControlFlow::Continue(NodeSources {
             tail: RemoteTailSource::new(self.client.clone(), Handle::current()),
             head: RemoteHeadSource::new(self.client.clone()),
