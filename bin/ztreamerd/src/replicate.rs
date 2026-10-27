@@ -21,7 +21,7 @@ use tracing::info;
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_rpc::client::GetBlockchainInfoResponse;
 use ztreamer_indexer::index::{Index, range_meta::NodeId};
-use ztreamer_remote::{FirstBlockWithBody as _, ZakuraClient};
+use ztreamer_remote::ZakuraClient;
 use ztreamer_service::RemoteBackend;
 use ztreamer_verify::{
     attest::JsonRpcAttestor,
@@ -49,14 +49,6 @@ impl ReplicateArgs {
         let key = VerifyingKey::from_bytes(&SNAPSHOT_PUBKEY).expect("the built-in key is valid");
         let source = self.replicate_from.clone().expect("--remote-rpc requires --replicate-from");
         Replica { source, key }
-    }
-
-    /// Logs the new import state of a replica at info level: `tail` or `following`. Does
-    /// nothing in the embedded mode.
-    pub(crate) fn log_import_state(&self, state: &'static str) {
-        if self.replicate_from.is_some() {
-            info!(import_state = state);
-        }
     }
 }
 
@@ -150,10 +142,9 @@ impl Replica {
                 .wrap_err("index state task panicked")??
                 .sealed_through()
         };
-        // The tail, the samples and the tree states of zakura v1.5.1 (zakura-core/zakura#1725)
-        // need the blocks from the next block on.
+        // The samples and the tail read the block bodies from the next block on.
         let next = Height(sealed.map_or(0, |sealed| sealed + 1));
-        let first = info.first_block_with_body();
+        let first = info.prune_height().unwrap_or(Height::MIN);
         ensure!(
             next >= first,
             "the import needs block {}, but the remote zakura node keeps block bodies only from \
@@ -167,11 +158,7 @@ impl Replica {
         let source = self.source.connect(self.key).await?;
         let node = TrustedNode {
             attestor: Arc::new(JsonRpcAttestor::new(client.clone())),
-            sampler: Arc::new(
-                JsonRpcSampler::connect(client.clone())
-                    .await
-                    .wrap_err("read the prune height of the remote zakura node")?,
-            ),
+            sampler: Arc::new(JsonRpcSampler::new(client.clone())),
             id,
         };
         let seed = getrandom::u64().map_err(|error| eyre!("random sample seed: {error}"))?;

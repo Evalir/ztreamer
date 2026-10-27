@@ -20,14 +20,14 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::{info, warn};
-use zakura_chain::{block::Height, parameters::Network};
+use zakura_chain::parameters::Network;
 use zakura_rpc::client::GetBlockchainInfoResponse;
 use zakurad::components::metrics::{self, MetricsEndpoint};
 use ztreamer_indexer::{
     index::{BlockId, Index, range_meta::NodeId},
     pipeline::RemoteTailSource,
 };
-use ztreamer_remote::{Auth, FirstBlockWithBody as _, RpcClient, RpcCode, Secret, ZakuraClient};
+use ztreamer_remote::{Auth, RpcClient, RpcCode, Secret, ZakuraClient};
 use ztreamer_service::remote::{RemoteBackend, RemoteHeadSource};
 
 use crate::{
@@ -256,15 +256,15 @@ impl RemoteNode {
         else {
             return Ok(());
         };
+        info!(import_state = "tail");
         run_application(cli, grpc_server, index, &network, None, sources, shutdown).await
     }
 
     /// The sources over this node, when the node is ready for `index`. Breaks on shutdown.
     ///
     /// `info` is the latest `getblockchaininfo` answer. It refuses a node whose genesis block is
-    /// not the one of `network`, and a node that pruned the next block that the index needs.
-    /// Then it waits until the best block of the node is at or above the durable tip of the
-    /// index.
+    /// not the one of `network`. Then it waits until the best block of the node is at or above
+    /// the durable tip of the index.
     async fn sources(
         &self,
         mut info: GetBlockchainInfoResponse,
@@ -276,7 +276,7 @@ impl RemoteNode {
             .await
             .wrap_err("connect to the remote zakura node")?;
         let tip = IndexTip::read(index).await?;
-        while !tip.served_by(&info)? {
+        while !tip.served_by(&info) {
             info!(
                 best = info.blocks().0,
                 index_tip = tip.0.map(|tip| tip.height),
@@ -384,24 +384,8 @@ impl IndexTip {
     }
 
     /// True when the node of `info` has the tip, false while the node is below the tip.
-    ///
-    /// Refuses a node that pruned the next block that the index needs. The historical pass and
-    /// the head follower read the blocks above the tip, thus the first of them must be at or
-    /// above the prune height of the node.
-    fn served_by(self, info: &GetBlockchainInfoResponse) -> Result<bool> {
-        let next = Height(self.0.map_or(0, |tip| tip.height.saturating_add(1)));
-        let first = info.first_block_with_body();
-        if next < first {
-            return Err(eyre!(
-                "the index needs block {}, but the remote zakura node keeps block bodies only \
-                 from height {}: use a node that keeps these blocks, or an index with a tip at \
-                 or above {}",
-                next.0,
-                first.0,
-                first.0 - 1
-            ));
-        }
-        Ok(self.0.is_none_or(|tip| info.blocks().0 >= tip.height))
+    fn served_by(self, info: &GetBlockchainInfoResponse) -> bool {
+        self.0.is_none_or(|tip| info.blocks().0 >= tip.height)
     }
 }
 
