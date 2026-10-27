@@ -103,14 +103,14 @@
 //! | `submit_transaction` | `sendrawtransaction` | none |
 //!
 //! The caches keep only answers that do not change. The tree state of a block hash does not
-//! change. The mempool cache keeps only the txids of the latest `getrawmempool` answer, so its size follows
-//! the mempool of the node. `z_gettreestate` is the slowest call (0.2 to 2.6 s on mainnet), and
-//! the node does not cache it.
+//! change. The mempool cache keeps only the txids of the latest `getrawmempool` answer. Thus its
+//! size follows the mempool of the node. `z_gettreestate` is the slowest call (0.2 to 2.6 s on
+//! mainnet), and the node does not cache it.
 //!
-//! Each cache holds at most a budget of bytes (`TREE_CACHE_BYTES` and `MEMPOOL_CACHE_BYTES` in
-//! `remote/backend.rs`), so the memory of the backend does not grow over time. When an insert
-//! goes above the budget, the cache drops the entries that were used least recently. The bytes of an entry are
-//! an estimate. Each cache reports `ztreamer.remote_cache.bytes`,
+//! Each cache holds at most a budget of bytes: `TREE_CACHE_BYTES` or `MEMPOOL_CACHE_BYTES` in
+//! `remote/backend.rs`. Thus the memory of the backend does not grow over time. When an insert
+//! goes above the budget, the cache drops the entries that it used least recently. The bytes of
+//! an entry are an estimate. Each cache reports `ztreamer.remote_cache.bytes`,
 //! `ztreamer.remote_cache.entries`, `ztreamer.remote_cache.hits_total`,
 //! `ztreamer.remote_cache.misses_total` and `ztreamer.remote_cache.evictions_total`, with the
 //! label `cache`.
@@ -126,7 +126,7 @@
 //!   [`RpcError::is_block_not_found`]). A transaction that the node does not have is
 //!   [`RpcCode::INVALID_ADDRESS_OR_KEY`].
 //! - Only the head follower polls the tip of the node. A mempool stream ends when the head
-//!   follower publishes a new visible tip (see [`CompactService::subscribe`]), so the backend
+//!   follower publishes a new visible tip (see [`CompactService::subscribe`]). Thus the backend
 //!   does not poll the tip.
 //!
 //! # Status

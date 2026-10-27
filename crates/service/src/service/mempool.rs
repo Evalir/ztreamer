@@ -37,8 +37,8 @@ impl CompactService {
         let mut transactions = backend.mempool_transactions().await?;
         let (sender, receiver) = mpsc::channel(1);
         tokio::spawn(async move {
-            // The stream ends when the head follower publishes a new visible tip. It fails when
-            // the head is stale or in deep reorg recovery, because then no new tip comes.
+            // The stream ends when the head follower publishes a new visible tip. While the head
+            // is stale or in deep reorg recovery, no new tip comes. Thus the stream fails.
             let tip_changed = async move {
                 let snapshot = snapshots
                     .wait_for(|snapshot| {
@@ -86,8 +86,8 @@ impl CompactService {
                         }
                         return;
                     }
-                    // The client is gone. Without this, an idle stream sends nothing, and
-                    // thus it does not see the closed channel.
+                    // Stop when the client closes the stream. An idle stream sends nothing, thus
+                    // no send can find the closed channel.
                     () = sender.closed() => return,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
                         match backend.mempool_transactions().await {
@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(error.unwrap_err().code(), tonic::Code::Unavailable);
         assert!(stream.next().await.is_none());
 
-        // A stale head also refuses a new stream.
+        // While the head is stale, the service also refuses a new stream.
         let error = service.mempool_stream().await.err().unwrap();
         assert_eq!(error.code(), tonic::Code::Unavailable);
     }

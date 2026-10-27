@@ -424,7 +424,7 @@ impl Pool for IronwoodPool {
 /// for the map, and [`HeapBytes::heap_bytes`] of the value. The map reports its bytes, its
 /// entries, and its hits, misses and evictions as metrics with the label `cache`.
 ///
-/// The tree states in it do not change. A mempool entry is used only while
+/// The tree states in it do not change. The backend uses a mempool entry only while
 /// `getrawmempool` still lists its id.
 struct LruMap<K, V> {
     budget: usize,
