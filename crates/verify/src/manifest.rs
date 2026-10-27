@@ -44,7 +44,8 @@ use crate::epoch::Epochs;
 /// A snapshot manifest that obeys the rules in the module docs.
 ///
 /// The fields are private. Each way to get a manifest checks the rules: [`Manifest::new`],
-/// [`Manifest::from_json`] and serde. Thus a `Manifest` is always valid.
+/// [`Manifest::from_contiguous_entries`], [`Manifest::from_json`] and serde. Thus a `Manifest`
+/// is always valid.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(try_from = "ManifestFields")]
 pub struct Manifest(ManifestFields);
@@ -146,6 +147,44 @@ impl Manifest {
             entries,
         }
         .try_into()
+    }
+
+    /// The manifest of the `range_meta` entries of an index, for `network` with the genesis
+    /// block hash. `entries` are in height order from genesis. The manifest takes the entries
+    /// that follow each other from genesis, and stops at the first gap. It sets `epoch_end` on
+    /// its last entry, because [`Epochs`] closes an epoch at the last entry of a manifest. The
+    /// other entries keep their flag, and [`Manifest::new`] checks it with the epoch rule.
+    ///
+    /// `ztreamerd export-snapshot` and a peer source make their manifests with this
+    /// constructor. Thus an export and a peer give the same manifest for the same rows.
+    ///
+    /// ```
+    /// use zakura_chain::block;
+    /// use ztreamer_indexer::index::range_meta::ManifestEntry;
+    /// use ztreamer_verify::manifest::{Manifest, ManifestError};
+    ///
+    /// fn manifest(genesis: block::Hash, rows: Vec<ManifestEntry>) -> Result<Manifest, ManifestError> {
+    ///     Manifest::from_contiguous_entries("Mainnet", genesis, rows)
+    /// }
+    /// ```
+    pub fn from_contiguous_entries(
+        network: impl Into<String>,
+        genesis_hash: block::Hash,
+        entries: impl IntoIterator<Item = ManifestEntry>,
+    ) -> Result<Self, ManifestError> {
+        let mut entries: Vec<_> = entries
+            .into_iter()
+            .scan(0, |next_start, entry| {
+                (entry.start_height == *next_start).then(|| {
+                    *next_start = entry.end_height.saturating_add(1);
+                    entry
+                })
+            })
+            .collect();
+        if let Some(last) = entries.last_mut() {
+            last.epoch_end = true;
+        }
+        Self::new(network, genesis_hash, entries)
     }
 
     /// Parses a manifest and checks the rules.
@@ -469,6 +508,46 @@ mod tests {
         assert_eq!(entry["blob_len"], 121_034_512);
         assert_eq!(entry["epoch_end"], false);
         assert_eq!(json["entries"][1]["epoch_end"], true);
+    }
+
+    /// Twelve rows with the flags of the epoch rule: the rule closes an epoch at row 9 only.
+    #[test]
+    fn contiguous_entries_stop_at_the_first_gap_and_close_the_last_epoch() {
+        let mut rows = synthetic_entries(&[TreeSizes::default(); 12]);
+        rows[11].epoch_end = false;
+        rows.remove(7);
+
+        let manifest = Manifest::from_contiguous_entries("Mainnet", hash(0), rows.clone()).unwrap();
+        let prefix =
+            Manifest::from_contiguous_entries("Mainnet", hash(0), rows[..7].to_vec()).unwrap();
+
+        assert_eq!(manifest, prefix);
+        assert_eq!(manifest.sealed_through(), 6_999);
+        let flags: Vec<_> = manifest.entries().iter().map(|entry| entry.epoch_end).collect();
+        assert_eq!(flags, [false, false, false, false, false, false, true]);
+    }
+
+    #[test]
+    fn contiguous_entries_keep_the_epoch_ends_of_the_rule_before_the_last_entry() {
+        let rows = synthetic_entries(&[TreeSizes::default(); 12]);
+        let mut forced = rows.clone();
+        forced[11].epoch_end = false;
+
+        let manifest = Manifest::from_contiguous_entries("Mainnet", hash(0), forced).unwrap();
+
+        assert_eq!(manifest.entries(), rows);
+        let epochs: Vec<_> = manifest.epochs().map(|epoch| epoch.end_height()).collect();
+        assert_eq!(epochs, [9_999, 11_999]);
+    }
+
+    #[test]
+    fn contiguous_entries_that_do_not_start_at_genesis_are_refused() {
+        let rows = synthetic_entries(&[TreeSizes::default(); 3]);
+
+        let error =
+            Manifest::from_contiguous_entries("Mainnet", hash(0), rows[1..].to_vec()).unwrap_err();
+
+        assert!(matches!(error, ManifestError::SealedThrough { last_end: None, .. }), "{error:?}");
     }
 
     #[test]
