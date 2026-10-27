@@ -5,9 +5,10 @@
 //! `manifests/<time>.json`, where `<time>` is UTC, for example `2026-10-26T143005Z`.
 //!
 //! The export reads the chain from the identity row of the index. It starts at genesis and stops
-//! at the first sealed range without a `range_meta` row. The last range of a manifest always
-//! closes an epoch, so the export sets `epoch_end` on the last entry. The row in the index keeps
-//! its flag.
+//! at the first sealed range without a `range_meta` row. [`Manifest::from_contiguous_entries`]
+//! makes the manifest of the rows: it sets `epoch_end` on the last entry, because the last range
+//! of a manifest always closes an epoch. A peer source makes its manifest in the same way. The
+//! row in the index keeps its flag.
 //!
 //! [`SnapshotWriter`] writes the files. A daily export into the same directory writes only the
 //! new ranges. It never replaces a manifest.
@@ -20,7 +21,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
-use eyre::{Result, WrapErr, bail, ensure, eyre};
+use eyre::{Result, WrapErr, bail, ensure};
 use tracing::{info, warn};
 use zakura_chain::parameters::Network;
 use zeroize::Zeroizing;
@@ -83,14 +84,11 @@ impl ExportReport {
         now: DateTime<Utc>,
         writer: &SnapshotWriter,
     ) -> Result<Self> {
-        let Rows { mut entries, missing: missing_rows } = Rows::read(index)?;
-        let last = entries
-            .last_mut()
-            .ok_or_else(|| eyre!("the index has no range_meta row for the range at genesis"))?;
-        // `ztreamer_verify::epoch::Epochs` closes an epoch at the last entry of a manifest.
-        last.epoch_end = true;
-        let manifest = Manifest::new(network.to_string(), network.genesis_hash(), entries)
-            .wrap_err("the range_meta rows do not make a valid manifest")?;
+        let Rows { entries, missing: missing_rows } = Rows::read(index)?;
+        ensure!(!entries.is_empty(), "the index has no range_meta row for the range at genesis");
+        let manifest =
+            Manifest::from_contiguous_entries(network.to_string(), network.genesis_hash(), entries)
+                .wrap_err("the range_meta rows do not make a valid manifest")?;
         let exported = writer.export(index, &manifest, now)?;
         Ok(Self {
             manifest: exported.manifest,

@@ -627,15 +627,11 @@ mod tests {
 
         let report = importer.run(shutdown).await.unwrap();
 
-        // A peer lists the ranges up to the last closed epoch only: range 24 closes none.
-        assert_eq!((report.epochs, report.ranges), (2, 20));
-        assert_eq!((report.sealed_through, report.verified_through), (Some(19_999), Some(19_999)));
-        for start in (0..20).map(|range| range * RANGE_SIZE) {
-            let blob = import.target.read_sealed_range_bytes(start).unwrap();
-            assert_eq!(blob, import.source.index.read_sealed_range_bytes(start).unwrap());
-        }
+        // The manifest of the peer closes the short last epoch at range 24, as an export does.
+        assert_eq!((report.epochs, report.ranges), (3, 25));
+        import.assert_target_has_source_blobs();
         assert!(server.refusals() > 0);
-        assert_eq!(server.requests().len(), 20);
+        assert_eq!(server.requests().len(), 25);
     }
 
     /// One epoch of ten ranges: only its own blob fetches can overlap.

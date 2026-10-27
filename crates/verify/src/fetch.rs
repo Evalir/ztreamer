@@ -10,9 +10,10 @@
 //!   also change that key. It reads a blob from its [`RangePath`] with an HTTP `Range` request.
 //!   It sends at most `HTTP_BLOB_REQUESTS` (32) blob requests at a time.
 //! - [`PeerSource`] asks a ztreamer that serves the Replicator gRPC service. It builds the
-//!   manifest from `ListRanges`, up to the last listed range that closes an epoch. It opens at
-//!   most [`PEER_RANGE_STREAMS`] `GetRange` streams at a time. When the peer refuses a stream
-//!   with `RESOURCE_EXHAUSTED`, it waits and asks again: a busy peer is not a failed peer.
+//!   manifest from `ListRanges` with [`Manifest::from_contiguous_entries`], as
+//!   `ztreamerd export-snapshot` does. It opens at most [`PEER_RANGE_STREAMS`] `GetRange`
+//!   streams at a time. When the peer refuses a stream with `RESOURCE_EXHAUSTED`, it waits and
+//!   asks again: a busy peer is not a failed peer.
 //!
 //! [`Fetcher`] reads complete blobs from a source. It continues a cut transfer from the last
 //! byte that it received, and it checks the length and the BLAKE3 digest of each blob against
@@ -506,8 +507,8 @@ impl PeerSource {
 
 #[async_trait]
 impl RangeSource for PeerSource {
-    /// Builds the manifest from the listed ranges: the ranges that follow each other from
-    /// genesis, up to the last one that closes an epoch.
+    /// Builds the manifest from the listed ranges with [`Manifest::from_contiguous_entries`]: the
+    /// ranges that follow each other from genesis, with `epoch_end` on the last one.
     async fn manifest(&self) -> Result<Manifest, FetchError> {
         let mut client = self.client.clone();
         let info = client.get_export_info(replicate::Empty {}).await?.into_inner();
@@ -520,16 +521,9 @@ impl RangeSource for PeerSource {
             client.list_ranges(ListRangesRequest { from_start_height: 0 }).await?.into_inner();
         let mut entries = Vec::new();
         while let Some(entry) = listed.message().await? {
-            let entry = ManifestEntry::try_from(entry)?;
-            let next = entries.last().map_or(0, |last: &ManifestEntry| last.end_height + 1);
-            if entry.start_height != next {
-                break;
-            }
-            entries.push(entry);
+            entries.push(ManifestEntry::try_from(entry)?);
         }
-        let closed = entries.iter().rposition(|entry| entry.epoch_end).map_or(0, |at| at + 1);
-        entries.truncate(closed);
-        Ok(Manifest::new(info.network, block::Hash(genesis_hash), entries)?)
+        Ok(Manifest::from_contiguous_entries(info.network, block::Hash(genesis_hash), entries)?)
     }
 
     async fn fetch_blob(
@@ -674,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_manifest_ends_at_the_last_closed_epoch_and_blobs_resume() {
+    async fn peer_manifest_closes_the_last_epoch_at_the_last_range_and_blobs_resume() {
         let source = SourceIndex::new(RANGES).await;
         let (_sender, snapshots) = watch::channel(ServingSnapshot::from(source.state));
         let service =
@@ -687,10 +681,8 @@ mod tests {
 
         let manifest = peer.manifest().await.unwrap();
 
-        // The rows of ranges 10 and 11 are in no closed epoch.
-        let mut expected = source.entries();
-        expected.truncate(10);
-        assert_eq!(manifest.entries(), expected);
+        // The rule closes no epoch at range 11. The manifest closes it there, as an export does.
+        assert_eq!(manifest.entries(), source.entries());
         let entry = &manifest.entries()[2];
         let blob = source.index.read_sealed_range_bytes(2_000).unwrap().unwrap();
         let mut tail = Vec::new();

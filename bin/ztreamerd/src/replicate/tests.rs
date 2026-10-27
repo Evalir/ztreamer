@@ -236,8 +236,8 @@ async fn a_fresh_replica_imports_three_epochs_then_follows_the_chain() {
 }
 
 /// The tail seals two ranges after the import. The filler writes their rows from the node of
-/// `--remote-rpc`. Then the Replicator lists all ranges, a peer gives the ranges through the last
-/// epoch end, and `export-snapshot` of the replica gives a manifest that passes the epoch rule.
+/// `--remote-rpc`. Then the Replicator lists all ranges, and a peer and `export-snapshot` of the
+/// replica both give a manifest of all ranges that passes the epoch rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replica_fills_the_rows_of_the_ranges_that_the_tail_seals() {
     const TAIL_SEALED: u32 = SEALED + 2 * RANGE_SIZE;
@@ -254,8 +254,8 @@ async fn a_replica_fills_the_rows_of_the_ranges_that_the_tail_seals() {
 
     assert_eq!(listed.last(), Some(&(TAIL_SEALED + 1 - RANGE_SIZE)));
     // The last imported range, 20,000, ends a short epoch of the snapshot only. The two tail
-    // ranges continue that epoch, thus the last epoch end of the peer is 19,999.
-    assert_eq!(peer.sealed_through(), 19_999);
+    // ranges continue that epoch, and the manifest of the peer closes it at the last tail range.
+    assert_eq!(peer.sealed_through(), TAIL_SEALED);
     {
         let index = Index::open_existing(dir.path(), 1 << 30).unwrap();
         let imported = index.range_meta(20_000).unwrap().unwrap();
