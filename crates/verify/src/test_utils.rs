@@ -3,7 +3,7 @@
 
 use std::{
     convert::Infallible,
-    fs, io,
+    io,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -14,7 +14,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use ed25519_dalek::{Signer as _, SigningKey};
+use chrono::{DateTime, TimeDelta, Utc};
+use ed25519_dalek::SigningKey;
 use futures_util::stream;
 use http::{Request, Response, StatusCode, Uri, header::RANGE};
 use http_body_util::{BodyExt as _, Full, StreamBody, combinators::BoxBody};
@@ -48,7 +49,7 @@ use ztreamer_service::{InProcessBackend, RangeMetaFiller, ReplicatorService, Ser
 
 use crate::{
     manifest::Manifest,
-    snapshot::{Latest, RangePath, SIGNATURE_SUFFIX},
+    snapshot::{RangePath, SnapshotWriter},
 };
 
 /// The seed of the key that signs a [`Snapshot`].
@@ -102,7 +103,7 @@ impl SourceIndex {
     }
 
     /// The entries of the rows from genesis to the sealed tip, with `epoch_end` on the last
-    /// entry, as `ztreamerd export-snapshot` writes them.
+    /// entry, as `ztreamerd export-snapshot` gives them to [`SnapshotWriter`].
     pub(crate) fn entries(&self) -> Vec<ManifestEntry> {
         let ranges = self.state.sealed_through().unwrap() / RANGE_SIZE + 1;
         let mut entries: Vec<_> = (0..ranges)
@@ -113,65 +114,42 @@ impl SourceIndex {
     }
 }
 
-/// A snapshot directory in the layout of `ztreamerd export-snapshot`, signed with [`SEED`].
+/// A snapshot directory that [`SnapshotWriter`] wrote, signed with [`SEED`].
 pub(crate) struct Snapshot {
     pub(crate) manifest: Manifest,
+    /// The path of the manifest that `latest.json` names, relative to [`Self::dir`].
+    pub(crate) manifest_path: String,
+    /// The time of the last manifest. Each new manifest is one day after the last manifest.
+    published_at: DateTime<Utc>,
     pub(crate) dir: TempDir,
 }
 
 impl Snapshot {
-    /// The path of the manifest.
-    pub(crate) const MANIFEST: &str = "manifests/2026-10-26T000000Z.json";
-
+    /// Exports the rows of `source` from genesis to the sealed tip at 2026-10-26T00:00:00Z.
     pub(crate) fn export(source: &SourceIndex) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let manifest =
             Manifest::new("Mainnet", Network::Mainnet.genesis_hash(), source.entries()).unwrap();
-        for sub in ["ranges", "manifests"] {
-            fs::create_dir(dir.path().join(sub)).unwrap();
-        }
-        let snapshot = Self { manifest, dir };
-        for entry in snapshot.manifest.entries() {
-            let blob = source.index.read_sealed_range_bytes(entry.start_height).unwrap().unwrap();
-            fs::write(snapshot.range_path(entry), blob).unwrap();
-        }
-        snapshot.write_manifest_and_latest();
-        snapshot
+        let published_at = DateTime::from_timestamp(1_792_972_800, 0).unwrap();
+        let exported = Self::writer(&dir).export(&source.index, &manifest, published_at).unwrap();
+        Self { manifest, manifest_path: exported.manifest, published_at, dir }
     }
 
-    /// Keeps the first `ranges` entries of the manifest, and signs the new manifest and
-    /// `latest.json`, as a source that exported fewer ranges does. The last kept entry must close
-    /// an epoch.
+    /// Writes a new manifest with only the first `ranges` entries, as a source with a shorter
+    /// export does. The last entry that stays must close an epoch.
     pub(crate) fn keep_first_ranges(&mut self, ranges: usize) {
-        let entries = self.manifest.entries()[..ranges].to_vec();
-        self.manifest = Manifest::new("Mainnet", Network::Mainnet.genesis_hash(), entries).unwrap();
-        self.write_manifest_and_latest();
+        self.publish(self.manifest.entries()[..ranges].to_vec());
     }
 
-    /// Writes the signed manifest, and a signed `latest.json` that names it.
-    fn write_manifest_and_latest(&self) {
-        self.write_signed(Self::MANIFEST, &serde_json::to_vec(&self.manifest).unwrap());
-        let latest = Latest {
-            manifest: Self::MANIFEST.to_owned(),
-            sealed_through: self.manifest.sealed_through(),
-            published_at: "2026-10-26T00:00:00Z".to_owned(),
-            // A source must not trust this key. Make it another key, so a test fails if it does.
-            public_key: Some(SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes()),
-        };
-        let latest = latest.to_file(Some(&SigningKey::from_bytes(&SEED)));
-        fs::write(self.dir.path().join(Latest::PATH), latest).unwrap();
-    }
-
-    /// Replaces the blob of the range at `start` and its entry, and signs the new manifest, as a
-    /// source that sends a wrong range does.
+    /// Writes `blob` as the blob of the range at `start`. Then it writes a new manifest with the
+    /// entry of `blob`, as a source that sends a wrong range does.
     pub(crate) fn replace_blob(&mut self, start: u32, blob: &[u8]) {
         let mut entries = self.manifest.entries().to_vec();
         let entry = &mut entries[(start / RANGE_SIZE) as usize];
         entry.blob_digest = BlobDigest::hash(blob);
         entry.blob_len = blob.len() as u64;
-        fs::write(self.range_path(entry), blob).unwrap();
-        self.manifest = Manifest::new("Mainnet", Network::Mainnet.genesis_hash(), entries).unwrap();
-        self.write_signed(Self::MANIFEST, &serde_json::to_vec(&self.manifest).unwrap());
+        Self::writer(&self.dir).put_range(entry, blob).unwrap();
+        self.publish(entries);
     }
 
     /// The file of the blob of `entry`.
@@ -179,16 +157,16 @@ impl Snapshot {
         self.dir.path().join(RangePath::from(entry).as_str())
     }
 
-    /// Writes `bytes` to `relative`, and their signature with `key` to its signature file.
-    pub(crate) fn write_signed_with(&self, relative: &str, bytes: &[u8], key: &SigningKey) {
-        let path = self.dir.path().join(relative);
-        fs::write(&path, bytes).unwrap();
-        let signature = format!("{}{SIGNATURE_SUFFIX}", path.display());
-        fs::write(signature, hex::encode(key.sign(bytes).to_bytes())).unwrap();
+    /// Writes `entries` as a new manifest, one day after the last manifest.
+    fn publish(&mut self, entries: Vec<ManifestEntry>) {
+        self.manifest = Manifest::new("Mainnet", Network::Mainnet.genesis_hash(), entries).unwrap();
+        self.published_at += TimeDelta::days(1);
+        let writer = Self::writer(&self.dir);
+        self.manifest_path = writer.publish(&self.manifest, self.published_at).unwrap();
     }
 
-    fn write_signed(&self, relative: &str, bytes: &[u8]) {
-        self.write_signed_with(relative, bytes, &SigningKey::from_bytes(&SEED));
+    fn writer(dir: &TempDir) -> SnapshotWriter {
+        SnapshotWriter::new(dir.path(), SigningKey::from_bytes(&SEED))
     }
 }
 

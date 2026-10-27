@@ -8076,6 +8076,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "criterion",
  "ed25519-dalek",
  "futures-util",
@@ -8115,7 +8116,6 @@ dependencies = [
 name = "ztreamerd"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "chrono",
  "clap",
