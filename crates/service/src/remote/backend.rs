@@ -11,17 +11,14 @@ use std::{
     hash::Hash,
     mem::size_of,
     ops::RangeInclusive,
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
 use futures_util::{StreamExt as _, TryStreamExt as _, future, stream};
 use lru::LruCache;
 use sapling_crypto::Node as SaplingNode;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block},
@@ -41,7 +38,7 @@ use zakura_rpc::{
     },
     methods::GetAddressUtxosRequest,
 };
-use zakura_state::{HashOrHeight, MAX_BLOCK_REORG_HEIGHT};
+use zakura_state::HashOrHeight;
 use ztreamer_indexer::frontier::FromRpc;
 use ztreamer_remote::{RpcCode, RpcError, ZakuraClient};
 
@@ -51,9 +48,6 @@ use crate::backend::{
 
 /// The bytes that the tree-state cache can hold: approximately 4,000 tree states.
 const TREE_CACHE_BYTES: usize = 16 << 20;
-
-/// The bytes that the subtree cache of one pool can hold: approximately 16,000 subtrees.
-const SUBTREE_CACHE_BYTES: usize = 2 << 20;
 
 /// The most `getrawtransaction` calls in flight for one mempool read.
 const MEMPOOL_FETCHES: usize = 16;
@@ -122,17 +116,10 @@ pub struct RemoteBackend {
     node: ZakuraClient,
     network: Network,
     tree_states: LruMap<block::Hash, TreeState>,
-    sapling_subtrees: SubtreeCache<SaplingNode>,
-    orchard_subtrees: SubtreeCache<orchard::tree::Node>,
-    ironwood_subtrees: SubtreeCache<ironwood::tree::Node>,
     mempool: LruMap<transaction::Hash, UnminedTx>,
-    tip: Arc<TipWatch>,
-}
-
-impl Drop for RemoteBackend {
-    fn drop(&mut self) {
-        self.tip.close();
-    }
+    /// The best block hash from the [`TipPoller`]. The poller stops when this receiver and
+    /// all tip listeners are dropped.
+    tip: watch::Receiver<BestHash>,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -165,20 +152,13 @@ impl RemoteBackend {
             return Err(RemoteConnectError::WrongGenesis { expected, found });
         }
         let best = info.best_block_hash();
-        let tip = Arc::new(TipWatch::new(best));
-        let poller = TipPoller {
-            node: node.clone(),
-            watch: Arc::clone(&tip),
-            last: best,
-            interval: TIP_POLL_INTERVAL,
-        };
+        let (sender, tip) = watch::channel(Ok(best));
+        let poller =
+            TipPoller { node: node.clone(), sender, last: best, interval: TIP_POLL_INTERVAL };
         let backend = Self {
             node,
             network,
             tree_states: LruMap::new("tree_states", TREE_CACHE_BYTES),
-            sapling_subtrees: LruMap::new("sapling_subtrees", SUBTREE_CACHE_BYTES),
-            orchard_subtrees: LruMap::new("orchard_subtrees", SUBTREE_CACHE_BYTES),
-            ironwood_subtrees: LruMap::new("ironwood_subtrees", SUBTREE_CACHE_BYTES),
             mempool: LruMap::new("mempool", MEMPOOL_CACHE_BYTES),
             tip,
         };
@@ -186,50 +166,12 @@ impl RemoteBackend {
     }
 
     /// Completed subtrees of `P` from `start`, at most `limit` of them.
-    ///
-    /// The subtrees in the cache from `start` on make the start of the answer. The node gives
-    /// only the rest. The cache keeps a subtree when it is at least [`MAX_BLOCK_REORG_HEIGHT`]
-    /// blocks below the tip, because a reorg cannot change it then.
     async fn subtrees<P: Pool>(
         &self,
         start: NoteCommitmentSubtreeIndex,
         limit: Option<NoteCommitmentSubtreeIndex>,
     ) -> Result<Subtrees<P::Node>, BackendError> {
-        let cache = P::cache(self);
-        // Index arithmetic is in `u32`, because a `u16` range cannot step past index 65535.
-        let end = limit.map_or(1 << 16, |limit| u32::from(start.0) + u32::from(limit.0));
-        let mut subtrees: Subtrees<P::Node> = (u32::from(start.0)..end)
-            .map_while(|index| u16::try_from(index).ok())
-            .map_while(|index| cache.get(&index).map(|subtree| (index, subtree)))
-            .map(|(index, subtree)| (NoteCommitmentSubtreeIndex(index), subtree))
-            .collect();
-        let next =
-            subtrees.last_key_value().map_or(u32::from(start.0), |(last, _)| u32::from(last.0) + 1);
-        let Some(next) = u16::try_from(next).ok().filter(|&next| u32::from(next) < end) else {
-            return Ok(subtrees);
-        };
-        let remaining = limit.map(|_| NoteCommitmentSubtreeIndex((end - u32::from(next)) as u16));
-        let next = NoteCommitmentSubtreeIndex(next);
-        let (response, tip) = tokio::join!(
-            self.node.z_get_subtrees_by_index(P::NAME, next, remaining),
-            self.tip_height(),
-        );
-        let fetched = P::parse_subtrees(response?, next)?;
-        // The tip only decides what goes in the cache. Without it, the answer is still good, and
-        // nothing goes in the cache.
-        let tip = tip
-            .inspect_err(
-                |error| tracing::debug!(%error, "remote zakura: no tip for the subtree cache"),
-            )
-            .ok()
-            .flatten();
-        let final_below = tip.map_or(0, |tip| tip.0.saturating_sub(MAX_BLOCK_REORG_HEIGHT));
-        fetched
-            .iter()
-            .filter(|(_, subtree)| subtree.end_height.0 <= final_below)
-            .for_each(|(index, subtree)| cache.insert(index.0, subtree.clone()));
-        subtrees.extend(fetched);
-        Ok(subtrees)
+        P::parse_subtrees(self.node.z_get_subtrees_by_index(P::NAME, start, limit).await?, start)
     }
 
     /// The error for a `z_gettreestate` that did not find the block of `hash`.
@@ -270,10 +212,10 @@ impl RemoteBackend {
     ///
     /// The cache key is the mined id, so the cache keeps the first authorizing data that the
     /// node gave for a version 5 transaction.
-    async fn mempool_transaction(&self, id: &str) -> Result<Option<UnminedTx>, BackendError> {
-        let id: transaction::Hash = id.parse().map_err(|_| {
-            BackendError::Unexpected(format!("remote zakura sent a bad mempool id {id:?}"))
-        })?;
+    async fn mempool_transaction(
+        &self,
+        id: transaction::Hash,
+    ) -> Result<Option<UnminedTx>, BackendError> {
         if let Some(cached) = self.mempool.get(&id) {
             return Ok(Some(cached));
         }
@@ -319,38 +261,6 @@ impl FetchedTransaction {
 /// The best block hash or the last poll error, as the tip poller sees it.
 type BestHash = Result<block::Hash, BackendError>;
 
-/// The best block hash for the tip listeners of a backend, shared with its [`TipPoller`].
-#[derive(Debug)]
-struct TipWatch {
-    sender: watch::Sender<BestHash>,
-    /// Wakes the poller when a listener is made or the backend is dropped.
-    wake: Notify,
-    /// Set when the backend is dropped.
-    closed: AtomicBool,
-}
-
-impl TipWatch {
-    fn new(best: block::Hash) -> Self {
-        Self {
-            sender: watch::Sender::new(Ok(best)),
-            wake: Notify::new(),
-            closed: AtomicBool::new(false),
-        }
-    }
-
-    /// A listener that starts from the hash of now.
-    fn listener(&self) -> RemoteTipListener {
-        let receiver = self.sender.subscribe();
-        self.wake.notify_one();
-        RemoteTipListener(receiver)
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.wake.notify_one();
-    }
-}
-
 /// Polls the best block hash for the tip listeners of one [`RemoteBackend`].
 ///
 /// [`RemoteBackend::connect`] returns it. Spawn [`TipPoller::run`]: without it, no tip listener
@@ -358,41 +268,24 @@ impl TipWatch {
 #[derive(Debug)]
 pub struct TipPoller {
     node: ZakuraClient,
-    watch: Arc<TipWatch>,
+    sender: watch::Sender<BestHash>,
     last: block::Hash,
+    /// The time between two `getbestblockhash` calls: [`TIP_POLL_INTERVAL`].
     interval: Duration,
 }
 
 impl TipPoller {
-    /// Sets the time between two `getbestblockhash` calls. The default is one second.
-    #[must_use]
-    pub const fn with_interval(mut self, interval: Duration) -> Self {
-        self.interval = interval;
-        self
-    }
-
-    /// Calls `getbestblockhash` once per interval while at least one tip listener exists. It wakes
-    /// the listeners when the hash changes or a call fails. After a failure, a hash that is the
-    /// same as before the failure wakes nobody. While no listener exists, it makes no calls. It
-    /// returns when the backend is dropped and no listener is left.
-    ///
-    /// After a time without listeners, the hash that it keeps can be old. The first poll then
-    /// wakes the new listeners, also for a change before they were made. A mempool stream then
-    /// ends one block early, which is safe. A change after a listener is made always wakes it.
+    /// Calls `getbestblockhash` once per interval. It wakes the tip listeners when the hash
+    /// changes or a call fails. After a failure, a hash that is the same as before the failure
+    /// wakes nobody. It returns when the backend and all tip listeners are dropped.
     pub async fn run(mut self) {
         let mut interval = tokio::time::interval(self.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            if self.watch.sender.receiver_count() == 0 {
-                if self.watch.closed.load(Ordering::SeqCst) {
-                    return;
-                }
-                self.watch.wake.notified().await;
-                interval.reset_immediately();
-                continue;
+            tokio::select! {
+                () = self.sender.closed() => return,
+                _ = interval.tick() => self.poll().await,
             }
-            interval.tick().await;
-            self.poll().await;
         }
     }
 
@@ -402,12 +295,12 @@ impl TipPoller {
                 let changed = best.hash() != self.last;
                 self.last = best.hash();
                 let last = self.last;
-                self.watch.sender.send_if_modified(|value| {
+                self.sender.send_if_modified(|value| {
                     *value = Ok(last);
                     changed
                 });
             }
-            Err(error) => self.watch.sender.send_modify(|value| *value = Err(error.into())),
+            Err(error) => self.sender.send_modify(|value| *value = Err(error.into())),
         }
     }
 }
@@ -521,13 +414,12 @@ impl<T> OrNotFound<T> for Result<T, RpcError> {
     }
 }
 
-/// A shielded pool: its name in `z_getsubtreesbyindex`, its root type and its cache.
+/// A shielded pool: its name in `z_getsubtreesbyindex` and its root type.
 trait Pool {
     const NAME: &'static str;
     type Node: Clone + Send + Sync + 'static;
 
     fn root(bytes: [u8; 32]) -> Option<Self::Node>;
-    fn cache(backend: &RemoteBackend) -> &SubtreeCache<Self::Node>;
 
     /// Parses a `z_getsubtreesbyindex` answer that must start at `start`.
     ///
@@ -587,10 +479,6 @@ impl Pool for SaplingPool {
     fn root(bytes: [u8; 32]) -> Option<Self::Node> {
         SaplingNode::from_bytes(bytes).into()
     }
-
-    fn cache(backend: &RemoteBackend) -> &SubtreeCache<Self::Node> {
-        &backend.sapling_subtrees
-    }
 }
 
 impl Pool for OrchardPool {
@@ -599,10 +487,6 @@ impl Pool for OrchardPool {
 
     fn root(bytes: [u8; 32]) -> Option<Self::Node> {
         Self::Node::try_from(bytes).ok()
-    }
-
-    fn cache(backend: &RemoteBackend) -> &SubtreeCache<Self::Node> {
-        &backend.orchard_subtrees
     }
 }
 
@@ -613,10 +497,6 @@ impl Pool for IronwoodPool {
     fn root(bytes: [u8; 32]) -> Option<Self::Node> {
         Self::Node::try_from(bytes).ok()
     }
-
-    fn cache(backend: &RemoteBackend) -> &SubtreeCache<Self::Node> {
-        &backend.ironwood_subtrees
-    }
 }
 
 /// A map in front of node answers that holds at most a budget of bytes. When an insert goes
@@ -626,7 +506,7 @@ impl Pool for IronwoodPool {
 /// for the map, and [`HeapBytes::heap_bytes`] of the value. The map reports its bytes, its
 /// entries, and its hits, misses and evictions as metrics with the label `cache`.
 ///
-/// The trees and subtrees in it do not change. A mempool entry is used only while
+/// The tree states in it do not change. A mempool entry is used only while
 /// `getrawmempool` still lists its id.
 struct LruMap<K, V> {
     budget: usize,
@@ -639,21 +519,12 @@ struct LruMapInner<K, V> {
     bytes: usize,
 }
 
-/// Completed subtrees of one pool by index.
-type SubtreeCache<Node> = LruMap<u16, NoteCommitmentSubtreeData<Node>>;
-
 /// The bytes that an entry of [`LruMap`] uses for the hash table and the list links.
 const ENTRY_OVERHEAD: usize = 64;
 
 /// The heap bytes of a cached value, as an estimate.
 trait HeapBytes {
     fn heap_bytes(&self) -> usize;
-}
-
-impl<Node> HeapBytes for NoteCommitmentSubtreeData<Node> {
-    fn heap_bytes(&self) -> usize {
-        0
-    }
 }
 
 impl HeapBytes for TreeState {
@@ -930,13 +801,20 @@ impl StateBackend for RemoteBackend {
             GetRawMempoolResponse::TxIds(ids) => ids,
             GetRawMempoolResponse::Verbose(objects) => objects.into_keys().collect(),
         };
+        let ids: Vec<transaction::Hash> = ids
+            .iter()
+            .map(|id| {
+                id.parse().map_err(|_| {
+                    BackendError::Unexpected(format!("remote zakura sent a bad mempool id {id:?}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
         // The cache keeps only the transactions that the node still has in its mempool.
-        let listed: HashSet<transaction::Hash> =
-            ids.iter().filter_map(|id| id.parse().ok()).collect();
+        let listed: HashSet<transaction::Hash> = ids.iter().copied().collect();
         self.mempool.retain(|id| listed.contains(id));
         stream::iter(ids)
             .map(|id| async move {
-                let fetched = self.mempool_transaction(&id).await;
+                let fetched = self.mempool_transaction(id).await;
                 (id, fetched)
             })
             .buffer_unordered(MEMPOOL_FETCHES)
@@ -975,7 +853,10 @@ impl StateBackend for RemoteBackend {
     }
 
     fn tip_listener(&self) -> Result<Box<dyn TipListener>, BackendError> {
-        Ok(Box::new(self.tip.listener()))
+        // A listener starts from the hash of now.
+        let mut receiver = self.tip.clone();
+        receiver.mark_unchanged();
+        Ok(Box::new(RemoteTipListener(receiver)))
     }
 }
 
@@ -1182,43 +1063,14 @@ mod tests {
         assert!(matches!(&error, BackendError::Unexpected(message) if message.contains("65535")));
     }
 
-    #[tokio::test]
-    async fn subtrees_without_a_tip_are_served_and_not_cached() {
-        let root = hex::encode(orchard_root(1).to_repr());
-        let mock = MockNode::start(move |_, seen| match seen.body["method"].as_str().unwrap() {
-            "getblockcount" => Reply::Close,
-            "z_getsubtreesbyindex" => Reply::Result(json!({
-                "pool": "orchard",
-                "start_index": 0,
-                "subtrees": [{"root": root, "end_height": 100}],
-            })),
-            "getblockchaininfo" => {
-                Reply::Result(serde_json::to_value(GetBlockchainInfoResponse::default()).unwrap())
-            }
-            _ => Reply::Result(json!(Network::Mainnet.genesis_hash().to_string())),
-        })
-        .await;
-        let backend = backend(&mock).await;
-        let one = Some(NoteCommitmentSubtreeIndex(1));
-        assert_eq!(
-            backend.orchard_subtrees(NoteCommitmentSubtreeIndex(0), one).await.unwrap().len(),
-            1
-        );
-        let requests = mock.seen().len();
-        backend.orchard_subtrees(NoteCommitmentSubtreeIndex(0), one).await.unwrap();
-        assert!(mock.seen().len() > requests);
-    }
-
     #[test]
     fn lru_map_keeps_its_byte_budget_and_reports_it() {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let map: SubtreeCache<orchard::tree::Node> =
+        let map: LruMap<u16, TreeState> =
             metrics::with_local_recorder(&recorder, || LruMap::new("test", 1_000));
-        let entry = size_of::<(u16, NoteCommitmentSubtreeData<orchard::tree::Node>, usize)>()
-            + ENTRY_OVERHEAD;
-        let subtree = NoteCommitmentSubtreeData::new(block::Height(1), orchard_root(1));
-        (0..100).for_each(|index| map.insert(index, subtree));
+        let entry = size_of::<(u16, TreeState, usize)>() + ENTRY_OVERHEAD;
+        (0..100).for_each(|index| map.insert(index, TreeState::default()));
         let kept = 1_000 / entry;
         assert_eq!(map.lock().entries.len(), kept);
         assert!(map.lock().bytes <= 1_000);
@@ -1247,38 +1099,6 @@ mod tests {
         );
         assert_eq!(values["ztreamer.remote_cache.hits_total"], DebugValue::Counter(1));
         assert_eq!(values["ztreamer.remote_cache.misses_total"], DebugValue::Counter(1));
-    }
-
-    #[tokio::test]
-    async fn cached_subtrees_make_no_request() {
-        // Subtree 0 is final. Subtree 1 is 10 blocks below the tip.
-        let mock = mainnet(10_000, |_, params| {
-            let subtrees: Vec<_> = [(0, 100), (1, 9_990)][params[1].as_u64().unwrap() as usize..]
-                .iter()
-                .map(|&(seed, end)| json!({"root": hex::encode(orchard_root(seed).to_repr()), "end_height": end}))
-                .collect();
-            Reply::Result(json!({"pool": "orchard", "start_index": params[1], "subtrees": subtrees}))
-        })
-        .await;
-        let backend = backend(&mock).await;
-        let start = NoteCommitmentSubtreeIndex(0);
-        let all = backend.orchard_subtrees(start, None).await.unwrap();
-        assert_eq!(all.len(), 2);
-        let requests = calls(&mock).len();
-
-        let one = Some(NoteCommitmentSubtreeIndex(1));
-        assert_eq!(backend.orchard_subtrees(start, one).await.unwrap().len(), 1);
-        assert_eq!(calls(&mock).len(), requests);
-
-        // Subtree 1 is not final, so the node gives it again, from index 1.
-        assert_eq!(backend.orchard_subtrees(start, None).await.unwrap(), all);
-        let sent = calls(&mock);
-        let subtree_requests: Vec<_> = sent[requests..]
-            .iter()
-            .filter(|seen| seen.body["method"] == "z_getsubtreesbyindex")
-            .collect();
-        assert_eq!(subtree_requests.len(), 1);
-        assert_eq!(subtree_requests[0].body["params"], json!(["orchard", 1]));
     }
 
     fn tree_state_answer(hash: block::Hash, orchard_root: Option<Vec<u8>>) -> Value {
@@ -1531,14 +1351,10 @@ mod tests {
         let (backend, poller) = RemoteBackend::connect(node, Network::Mainnet).await.unwrap();
         // A short interval keeps the test fast. Each wait covers several polls.
         let interval = Duration::from_millis(10);
-        let poller = tokio::spawn(poller.with_interval(interval).run());
+        let poller = tokio::spawn(TipPoller { interval, ..poller }.run());
         let wait = 20 * interval;
         let polls =
             || mock.seen().iter().filter(|seen| seen.body["method"] == "getbestblockhash").count();
-
-        // Without a listener, the poller makes no calls.
-        tokio::time::sleep(wait).await;
-        assert_eq!(polls(), 0);
 
         // The poller gives the same hash as at connect, so nothing wakes.
         let mut first = backend.tip_listener().unwrap();
