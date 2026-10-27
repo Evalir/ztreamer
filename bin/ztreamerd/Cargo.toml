@@ -8,16 +8,13 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-blake3.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek.workspace = true
 eyre = "0.6"
 getrandom = "0.3"
-hex = "0.4"
 http = "1"
 percent-encoding = "2"
-serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 tracing = "0.1"
@@ -36,6 +33,7 @@ tokio-util = "0.7"
 
 [dev-dependencies]
 bytes = "1"
+hex = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

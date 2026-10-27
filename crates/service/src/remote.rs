@@ -16,7 +16,7 @@
 //!   wallet ---- gRPC ----> CompactService
 //!                            |          |
 //!            blocks and      |          |  tree states, subtrees, transactions,
-//!            block ranges    |          |  addresses, mempool, submit, tip changes
+//!            block ranges    |          |  addresses, mempool, submit
 //!                            v          v
 //!                     compact index    RemoteBackend -------------------------+
 //!                        (LMDB)                                               |
@@ -96,31 +96,28 @@
 //! | `tip_height` | `getblockcount` | none |
 //! | `block` | `getblock <hash> 0` | none |
 //! | `transaction` | `getrawtransaction <txid> 1` | none |
-//! | `tree_state` | `z_gettreestate <hash>` | by block hash, 16 MiB |
-//! | `sapling_subtrees`, `orchard_subtrees`, `ironwood_subtrees` | `z_getsubtreesbyindex` | by index, when final, 2 MiB per pool |
-//! | `address_transaction_ids`, `address_balance`, `address_utxos` | `getaddresstxids`, `getaddressbalance`, `getaddressutxos` | none |
-//! | `mempool_transactions` | `getrawmempool`, then `getrawtransaction <txid> 1` | by txid, 160 MiB |
+//! | `tree_state` | `z_gettreestate <hash>`, then `getblockchaininfo` when the block is not found | by block hash |
+//! | `sapling_subtrees`, `orchard_subtrees`, `ironwood_subtrees` | `z_getsubtreesbyindex` | none |
+//! | `address_transaction_ids` | `getblockcount` when the start is above 0, then `getaddresstxids` | none |
+//! | `address_balance`, `address_utxos` | `getaddressbalance`, `getaddressutxos` | none |
+//! | `mempool_transactions` | `getrawmempool`, then `getrawtransaction <txid> 1` | by txid |
 //! | `submit_transaction` | `sendrawtransaction` | none |
-//! | `tip_listener` | `getbestblockhash`, from the [`TipPoller`] | none |
 //!
 //! The caches keep only answers that do not change. The tree state of a block hash does not
-//! change. A subtree goes in the cache only when it is at least
-//! [`MAX_BLOCK_REORG_HEIGHT`](zakura_state::MAX_BLOCK_REORG_HEIGHT) blocks below the tip. The
-//! mempool cache keeps only the txids of the latest `getrawmempool` answer, so its size follows
-//! the mempool of the node. `z_gettreestate` is the slowest call (0.2 to 2.6 s on mainnet), and
-//! the node does not cache it.
+//! change. The mempool cache keeps only the txids of the latest `getrawmempool` answer. Thus its
+//! size follows the mempool of the node. `z_gettreestate` is the slowest call (0.2 to 2.6 s on
+//! mainnet), and the node does not cache it.
 //!
-//! Each cache holds at most the bytes in the table, so the memory of the backend does not grow
-//! over time: about 182 MiB in all, and normally much less. When an insert goes above the
-//! budget, the cache drops the entries that were used least recently. The bytes of an entry are
-//! an estimate. Each cache reports `ztreamer.remote_cache.bytes`,
+//! Each cache holds at most a budget of bytes: `TREE_CACHE_BYTES` or `MEMPOOL_CACHE_BYTES` in
+//! `remote/backend.rs`. Thus the memory of the backend does not grow over time. When an insert
+//! goes above the budget, the cache drops the entries that it used least recently. The bytes of
+//! an entry are an estimate. Each cache reports `ztreamer.remote_cache.bytes`,
 //! `ztreamer.remote_cache.entries`, `ztreamer.remote_cache.hits_total`,
 //! `ztreamer.remote_cache.misses_total` and `ztreamer.remote_cache.evictions_total`, with the
 //! label `cache`.
 //!
 //! [`RemoteBackend::connect`] refuses a node whose chain name or genesis hash is not the same as
-//! the network of the index. It also returns the [`TipPoller`]. The caller spawns
-//! [`TipPoller::run`], which calls `getbestblockhash` only while a tip listener exists.
+//! the network of the index.
 //!
 //! # Shared parts
 //!
@@ -129,10 +126,9 @@
 //!   for `getblockhash` above the tip [`RpcCode::MISC`] with a fixed message (see
 //!   [`RpcError::is_block_not_found`]). A transaction that the node does not have is
 //!   [`RpcCode::INVALID_ADDRESS_OR_KEY`] (see [`RpcError::is_transaction_not_found`]).
-//! - The head follower and the [`TipPoller`] both poll the tip of the node: the first with
-//!   `getblockchaininfo`, the second with `getbestblockhash`. While a mempool stream is open,
-//!   the node thus gets two tip calls per second for the same tip. One shared tip watch could
-//!   feed both.
+//! - Only the head follower polls the tip of the node. A mempool stream ends when the head
+//!   follower publishes a new visible tip (see [`CompactService::subscribe`]). Thus the backend
+//!   does not poll the tip.
 //!
 //! # Status
 //!
@@ -160,10 +156,11 @@
 //! [`StateBackend`]: crate::StateBackend
 //! [`CompactService`]: crate::CompactService
 //! [`CompactService::follow_head`]: crate::CompactService::follow_head
+//! [`CompactService::subscribe`]: crate::CompactService::subscribe
 //! [`HeadFollowerConfig::poll_interval`]: crate::HeadFollowerConfig::poll_interval
 
 mod backend;
 mod head;
 
-pub use backend::{RemoteBackend, RemoteConnectError, TipPoller};
+pub use backend::{RemoteBackend, RemoteConnectError};
 pub use head::RemoteHeadSource;
