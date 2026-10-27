@@ -42,6 +42,7 @@ use ztreamer_protocol::replicate::{
 };
 
 use crate::{
+    importer::MAX_BLOB_BYTES_BEFORE_INSTALL,
     manifest::{Manifest, ManifestError},
     snapshot::{Latest, LatestError, RangePath, SignatureFile},
 };
@@ -374,6 +375,27 @@ impl Iterator for RefusalBackoff {
     }
 }
 
+/// The HTTP/2 receive window of one `GetRange` stream of a [`PeerSource`]: the bytes that the
+/// peer can send on the stream before the client reads them. One stream moves at most this
+/// window in each round trip, thus 168 MB/s at 100 ms. The hyper default of 2 MiB gives 21 MB/s.
+pub const PEER_STREAM_WINDOW_BYTES: u32 = 16 << 20;
+
+/// The HTTP/2 receive window of the connection of a [`PeerSource`]. It holds the full window of
+/// each of the [`PEER_RANGE_STREAMS`] streams. The hyper default of 5 MiB is shared by all the
+/// streams and gives 52 MB/s at 100 ms. It is also the most received bytes that wait in memory
+/// for the client to read them.
+pub const PEER_CONNECTION_WINDOW_BYTES: u32 = PEER_STREAM_WINDOW_BYTES * PEER_RANGE_STREAMS as u32;
+
+/// The largest [`PEER_CONNECTION_WINDOW_BYTES`]: 1/16 of the blob budget of the import,
+/// [`MAX_BLOB_BYTES_BEFORE_INSTALL`], thus 128 MiB. The connection window grows with
+/// [`PEER_RANGE_STREAMS`]. A higher stream limit can thus need a smaller stream window.
+const MAX_PEER_CONNECTION_WINDOW_BYTES: u64 = MAX_BLOB_BYTES_BEFORE_INSTALL / 16;
+
+const _: () = assert!(
+    PEER_CONNECTION_WINDOW_BYTES as u64 <= MAX_PEER_CONNECTION_WINDOW_BYTES,
+    "the peer connection window is above its limit: lower PEER_STREAM_WINDOW_BYTES"
+);
+
 /// A ztreamer that serves the Replicator gRPC service.
 ///
 /// The clones of a source share one connection and one limit of [`PEER_RANGE_STREAMS`] open
@@ -401,9 +423,14 @@ impl PeerSource {
         Self { endpoint, client: ReplicatorClient::new(channel), range_streams }
     }
 
-    /// Connects to the Replicator service at `endpoint`.
+    /// Connects to the Replicator service at `endpoint`, with the receive windows
+    /// [`PEER_STREAM_WINDOW_BYTES`] and [`PEER_CONNECTION_WINDOW_BYTES`].
     pub async fn connect(endpoint: Uri) -> Result<Self, FetchError> {
-        let channel = Channel::builder(endpoint.clone()).connect().await?;
+        let channel = Channel::builder(endpoint.clone())
+            .initial_stream_window_size(PEER_STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(PEER_CONNECTION_WINDOW_BYTES)
+            .connect()
+            .await?;
         Ok(Self::new(endpoint, channel))
     }
 
