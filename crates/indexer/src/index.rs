@@ -126,7 +126,7 @@ mod tables;
 mod telemetry;
 mod writer;
 use metadata::Metadata;
-use range_meta::{BlobDigest, RangeMeta, VerifyState};
+use range_meta::{BlobMismatch, RangeMeta, VerifyState};
 use tables::{SealedRange, Tables, range_start};
 use telemetry::{WriteStage, record_state_metrics};
 use writer::IndexWriter;
@@ -273,21 +273,13 @@ pub enum IndexError {
     DuplicateHash { height: u32 },
     #[error("index has mutable rows; an install needs an index with no mutable rows")]
     MutableRows,
-    /// The length of a range blob is not the `blob_len` of its metadata.
-    #[error("range blob at {start} has {actual} bytes; the metadata gives {expected}")]
-    BlobLen {
+    /// A range blob does not have the `blob_len` or the `blob_digest` of its metadata.
+    #[error("range blob at {start} does not match its metadata: {mismatch}")]
+    Blob {
         /// The first height of the range.
         start: u32,
-        /// The length that the metadata gives.
-        expected: u64,
-        /// The length of the blob.
-        actual: u64,
-    },
-    /// The BLAKE3 digest of a range blob is not the `blob_digest` of its metadata.
-    #[error("range blob at {start} does not have the digest that the metadata gives")]
-    BlobDigest {
-        /// The first height of the range.
-        start: u32,
+        /// The value that does not match: the length or the digest.
+        mismatch: BlobMismatch,
     },
 }
 
@@ -358,6 +350,13 @@ impl Index {
     pub fn state(&self) -> Result<IndexState, IndexError> {
         let txn = self.env.read_txn()?;
         self.tables.metadata.get_state(&txn)
+    }
+
+    /// Returns the index state. If the index is not at `generation`, returns
+    /// [`IndexError::Generation`].
+    pub fn state_at(&self, generation: u64) -> Result<IndexState, IndexError> {
+        let txn = self.env.read_txn()?;
+        self.read_generation(&txn, generation)
     }
 
     /// Reads the metadata of the sealed range that starts at `start`, if any was written.
@@ -462,8 +461,7 @@ impl Index {
         blob: &[u8],
         meta: &RangeMeta,
     ) -> Result<IndexState, IndexError> {
-        let blob_len = u64::try_from(blob.len()).map_err(|_| IndexError::Overflow)?;
-        let blob_digest = BlobDigest::hash(blob);
+        let blob_check = meta.entry.check_blob(blob);
         let mut writer = IndexWriter::start_latest(&self.env, self.tables)?;
         let state = writer.state();
         let next = state.next_range_start()?;
@@ -473,13 +471,7 @@ impl Index {
         if state.has_mutable_rows() {
             return Err(IndexError::MutableRows);
         }
-        if blob_len != meta.entry.blob_len {
-            let expected = meta.entry.blob_len;
-            return Err(IndexError::BlobLen { start, expected, actual: blob_len });
-        }
-        if blob_digest != meta.entry.blob_digest {
-            return Err(IndexError::BlobDigest { start });
-        }
+        blob_check.map_err(|mismatch| IndexError::Blob { start, mismatch })?;
         // The index has no mutable rows. Thus the tip is the last block of the sealed ranges.
         let parent = state.durable_tip.map_or(GENESIS_PREVIOUS_BLOCK_HASH, |tip| tip.hash);
         let chain = SealedRange::new(start, blob)?.check_chain(parent, state.tree_sizes)?;
@@ -845,7 +837,7 @@ mod tests {
     use crate::test_utils::{hash, prepared, record};
     use crate::{
         codec::{ProtobufBlockRecord, decode_range_record, encode_range},
-        index::range_meta::full_meta,
+        index::range_meta::{BlobDigest, full_meta},
         ingest::OrderedBuilder,
     };
 
@@ -1247,21 +1239,21 @@ mod tests {
         long.entry.blob_len += 1;
         assert!(matches!(
             index.install_sealed_range(1_000, &blob, &long),
-            Err(IndexError::BlobLen { start: 1_000, expected, actual })
+            Err(IndexError::Blob { start: 1_000, mismatch: BlobMismatch::Len { expected, actual } })
                 if expected == len + 1 && actual == len
         ));
         let mut other = meta.clone();
         other.entry.blob_digest = BlobDigest::hash(b"another blob");
         assert!(matches!(
             index.install_sealed_range(1_000, &blob, &other),
-            Err(IndexError::BlobDigest { start: 1_000 })
+            Err(IndexError::Blob { start: 1_000, mismatch: BlobMismatch::Digest })
         ));
         // A changed byte does not change the length. It changes the digest.
         let mut changed = blob.clone();
         changed[blob.len() / 2] ^= 1;
         assert!(matches!(
             index.install_sealed_range(1_000, &changed, &meta),
-            Err(IndexError::BlobDigest { start: 1_000 })
+            Err(IndexError::Blob { start: 1_000, mismatch: BlobMismatch::Digest })
         ));
 
         assert_eq!(index.state().unwrap(), state);

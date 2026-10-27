@@ -23,7 +23,7 @@ use zakura_state::HashOrHeight;
 use ztreamer_indexer::{
     codec::CodecError,
     frontier::{FromRpc, RpcDecodeError},
-    index::range_meta::{Attested, PoolRoots, SubtreeNode},
+    index::range_meta::{Attested, NodeBytes, Pool, PoolRoots, SubtreeNode},
     parser::CompactParseError,
     types::RawBlockError,
 };
@@ -31,7 +31,6 @@ use ztreamer_remote::{RpcError, ZakuraClient};
 
 use crate::{
     epoch::{Epoch, EpochProof, Trees},
-    manifest::Pool,
     range::{Check, Reject},
 };
 
@@ -231,7 +230,7 @@ impl Epoch<'_> {
         let end = self.end_height();
         for pool in Pool::ALL {
             let completed: Vec<_> =
-                proof.completed.iter().filter(|root| Pool::from(&root.root) == pool).collect();
+                proof.completed.iter().filter(|root| root.root.pool() == pool).collect();
             let indices = completed.iter().map(|root| root.index.0);
             let (Some(start), Some(last)) = (indices.clone().min(), indices.max()) else {
                 continue;
@@ -382,10 +381,11 @@ impl Attestor for JsonRpcAttestor {
                     .subtrees()
                     .get(offset)
                     .ok_or(NodeError::MissingSubtree { pool, index })?;
-                hex::decode(&subtree.root)
+                subtree
+                    .root
+                    .parse::<NodeBytes>()
                     .ok()
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .and_then(|bytes| pool.subtree_node(bytes))
+                    .and_then(|bytes| pool.node(bytes))
                     .ok_or(NodeError::SubtreeRoot { pool, index })
             })
             .collect()

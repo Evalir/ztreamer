@@ -15,27 +15,25 @@ use prost::bytes::Bytes;
 use tokio::sync::{Semaphore, watch};
 use tonic::{Request, Response, Status};
 use zakura_chain::parameters::Network;
-use ztreamer_indexer::{
-    codec::RANGE_FORMAT_VERSION,
-    index::{
-        Index, IndexError,
-        range_meta::{ExportedRange, VerifyState},
-    },
+use ztreamer_indexer::index::{
+    Index, IndexError,
+    range_meta::{MANIFEST_VERSION, VerifyState},
 };
 use ztreamer_protocol::replicate::{
     Empty, ExportInfo, GetRangeRequest, ListRangesRequest, ManifestEntry, RangeChunk,
     replicator_server::Replicator,
 };
 
-use crate::{ServingSnapshot, service::RpcStream};
+use crate::{
+    ServingSnapshot,
+    service::{RpcStream, index_status},
+};
 
 /// The largest `data` of one [`RangeChunk`].
-pub const CHUNK_BYTES: usize = 1 << 20;
+pub(crate) const CHUNK_BYTES: usize = 1 << 20;
 /// The number of `GetRange` streams that can run at a time. A request above it fails with
 /// `RESOURCE_EXHAUSTED`.
 pub const MAX_RANGE_STREAMS: usize = 4;
-/// The version of the [`ManifestEntry`] message that the service sends.
-const MANIFEST_VERSION: u32 = 1;
 
 /// Serves the sealed ranges of an index over the Replicator gRPC service.
 ///
@@ -75,11 +73,7 @@ impl ReplicatorService {
 
     /// The generation of the current serving snapshot. Refuses while deep reorg recovery runs.
     fn generation(&self) -> Result<u64, Status> {
-        let snapshot = self.snapshots.borrow();
-        if !snapshot.ready {
-            return Err(Status::unavailable("deep reorg recovery is active"));
-        }
-        Ok(snapshot.generation)
+        self.snapshots.borrow().ready_generation()
     }
 
     /// Runs `read` against the index on a blocking thread.
@@ -91,10 +85,7 @@ impl ReplicatorService {
         tokio::task::spawn_blocking(move || read(&index))
             .await
             .map_err(|error| Status::internal(format!("index read task failed: {error}")))?
-            .map_err(|error| match error {
-                IndexError::Generation { .. } => Status::unavailable(error.to_string()),
-                other => Status::internal(other.to_string()),
-            })
+            .map_err(index_status)
     }
 }
 
@@ -108,26 +99,12 @@ impl Replicator for ReplicatorService {
         _request: Request<Empty>,
     ) -> Result<Response<ExportInfo>, Status> {
         let generation = self.generation()?;
-        let state = self
-            .read(move |index| {
-                let state = index.state()?;
-                if state.generation() != generation {
-                    return Err(IndexError::Generation {
-                        expected: generation,
-                        actual: state.generation(),
-                    });
-                }
-                Ok(state)
-            })
-            .await?;
+        let state = self.read(move |index| index.state_at(generation)).await?;
         Ok(Response::new(ExportInfo {
             network: self.network.to_string(),
             genesis_hash: self.network.genesis_hash().0.to_vec(),
-            range_versions: vec![RANGE_FORMAT_VERSION.into()],
             manifest_version: MANIFEST_VERSION,
             sealed_through: state.sealed_through(),
-            verified_through: state.verified_through(),
-            generation,
         }))
     }
 
@@ -141,7 +118,7 @@ impl Replicator for ReplicatorService {
         let entries = metas
             .into_iter()
             .filter(|meta| meta.state != VerifyState::Rejected)
-            .map(|meta| Ok(ExportedRange { entry: meta.entry, state: meta.state }.into()))
+            .map(|meta| Ok(meta.entry.into()))
             .collect::<Vec<_>>();
         Ok(Response::new(Box::pin(tokio_stream::iter(entries))))
     }
@@ -179,7 +156,7 @@ impl Replicator for ReplicatorService {
         let chunks = (first..blob.len()).step_by(CHUNK_BYTES).map(move |at| {
             let _ = &permit;
             let end = blob.len().min(at + CHUNK_BYTES);
-            Ok(RangeChunk { offset: at as u64, data: blob.slice(at..end) })
+            Ok(RangeChunk { data: blob.slice(at..end) })
         });
         Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
     }
@@ -196,8 +173,9 @@ mod tests {
         transport::{Channel, Server},
     };
     use zakura_chain::block;
-    use ztreamer_indexer::index::range_meta::{
-        BlobDigest, Frontiers, ManifestEntry as Entry, RangeMeta,
+    use ztreamer_indexer::{
+        codec::RANGE_FORMAT_VERSION,
+        index::range_meta::{BlobDigest, Frontiers, ManifestEntry as Entry, RangeMeta},
     };
     use ztreamer_protocol::{
         proto::{BlockId, compact_tx_streamer_client::CompactTxStreamerClient},
@@ -210,7 +188,6 @@ mod tests {
     struct Fixture {
         index: Arc<Index>,
         service: ReplicatorService,
-        generation: u64,
         snapshots: watch::Sender<ServingSnapshot>,
         _dir: tempfile::TempDir,
     }
@@ -257,7 +234,7 @@ mod tests {
             }
             let (snapshots, receiver) = watch::channel(ServingSnapshot::from(state));
             let service = ReplicatorService::new(Arc::clone(&index), receiver, &network);
-            Self { index, service, generation: state.generation(), snapshots, _dir: dir }
+            Self { index, service, snapshots, _dir: dir }
         }
 
         /// Serves CompactTxStreamer and the fixture's Replicator on one free local port, as
@@ -303,7 +280,6 @@ mod tests {
             .into_inner();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.message().await.unwrap() {
-            assert_eq!(chunk.offset, offset + bytes.len() as u64);
             assert!(chunk.data.len() <= CHUNK_BYTES);
             bytes.extend_from_slice(&chunk.data);
         }
@@ -319,11 +295,8 @@ mod tests {
             ExportInfo {
                 network: "Mainnet".to_owned(),
                 genesis_hash: Network::Mainnet.genesis_hash().0.to_vec(),
-                range_versions: vec![1],
                 manifest_version: 1,
                 sealed_through: Some(4_999),
-                verified_through: None,
-                generation: fixture.generation,
             }
         );
     }
@@ -341,7 +314,7 @@ mod tests {
         assert_eq!(block.height, 4_000);
         let mut replicator = ReplicatorClient::connect(endpoint).await.unwrap();
         let info = replicator.get_export_info(Empty {}).await.unwrap().into_inner();
-        assert_eq!(info.generation, fixture.generation);
+        assert_eq!(info.sealed_through, Some(4_999));
     }
 
     #[tokio::test]
@@ -355,12 +328,10 @@ mod tests {
             .into_inner();
         let mut listed = Vec::new();
         while let Some(entry) = stream.message().await.unwrap() {
-            listed.push(ExportedRange::try_from(entry).unwrap());
+            listed.push(Entry::try_from(entry).unwrap());
         }
-        let expected = [1_000, 2_000].map(|start| {
-            let meta = fixture.index.range_meta(start).unwrap().unwrap();
-            ExportedRange { entry: meta.entry, state: meta.state }
-        });
+        let expected =
+            [1_000, 2_000].map(|start| fixture.index.range_meta(start).unwrap().unwrap().entry);
         assert_eq!(listed, expected);
     }
 

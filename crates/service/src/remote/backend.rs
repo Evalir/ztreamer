@@ -37,7 +37,10 @@ use zakura_rpc::{
     methods::GetAddressUtxosRequest,
 };
 use zakura_state::HashOrHeight;
-use ztreamer_indexer::frontier::FromRpc;
+use ztreamer_indexer::{
+    frontier::FromRpc,
+    index::range_meta::{self, NodeBytes, SubtreeNode},
+};
 use ztreamer_remote::{FirstBlockWithBody as _, RpcError, ZakuraClient};
 
 use crate::backend::{
@@ -319,12 +322,15 @@ impl RpcTree for orchard::tree::NoteCommitmentTree {
     }
 }
 
-/// A shielded pool: its name in `z_getsubtreesbyindex` and its root type.
+/// A shielded pool: its [`range_meta::Pool`] and its root type.
 trait Pool {
-    const NAME: &'static str;
+    const POOL: range_meta::Pool;
+    /// The name of the pool in `z_getsubtreesbyindex`.
+    const NAME: &'static str = Self::POOL.as_str();
     type Node: Clone + Send + Sync + 'static;
 
-    fn root(bytes: [u8; 32]) -> Option<Self::Node>;
+    /// Returns the root in `node`. Returns `None` if `node` is a root of a different pool.
+    fn root_from_node(node: SubtreeNode) -> Option<Self::Node>;
 
     /// Parses a `z_getsubtreesbyindex` answer that must start at `start`.
     ///
@@ -361,10 +367,12 @@ trait Pool {
                         Self::NAME
                     ))
                 })?;
-                let root = hex::decode(&subtree.root)
+                let root = subtree
+                    .root
+                    .parse::<NodeBytes>()
                     .ok()
-                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                    .and_then(Self::root)
+                    .and_then(|bytes| Self::POOL.node(bytes))
+                    .and_then(Self::root_from_node)
                     .ok_or_else(|| bad_root(&subtree.root))?;
                 let data = NoteCommitmentSubtreeData::new(subtree.end_height, root);
                 Ok((NoteCommitmentSubtreeIndex(index), data))
@@ -378,29 +386,38 @@ enum OrchardPool {}
 enum IronwoodPool {}
 
 impl Pool for SaplingPool {
-    const NAME: &'static str = "sapling";
+    const POOL: range_meta::Pool = range_meta::Pool::Sapling;
     type Node = SaplingNode;
 
-    fn root(bytes: [u8; 32]) -> Option<Self::Node> {
-        SaplingNode::from_bytes(bytes).into()
+    fn root_from_node(node: SubtreeNode) -> Option<Self::Node> {
+        match node {
+            SubtreeNode::Sapling(root) => Some(root),
+            _ => None,
+        }
     }
 }
 
 impl Pool for OrchardPool {
-    const NAME: &'static str = "orchard";
+    const POOL: range_meta::Pool = range_meta::Pool::Orchard;
     type Node = orchard::tree::Node;
 
-    fn root(bytes: [u8; 32]) -> Option<Self::Node> {
-        Self::Node::try_from(bytes).ok()
+    fn root_from_node(node: SubtreeNode) -> Option<Self::Node> {
+        match node {
+            SubtreeNode::Orchard(root) => Some(root),
+            _ => None,
+        }
     }
 }
 
 impl Pool for IronwoodPool {
-    const NAME: &'static str = "ironwood";
+    const POOL: range_meta::Pool = range_meta::Pool::Ironwood;
     type Node = ironwood::tree::Node;
 
-    fn root(bytes: [u8; 32]) -> Option<Self::Node> {
-        Self::Node::try_from(bytes).ok()
+    fn root_from_node(node: SubtreeNode) -> Option<Self::Node> {
+        match node {
+            SubtreeNode::Ironwood(root) => Some(root),
+            _ => None,
+        }
     }
 }
 

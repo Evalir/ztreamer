@@ -380,7 +380,7 @@ impl RangeStream {
         }
         let stop = self.cut_at.unwrap_or(self.blob.len());
         let end = stop.min(self.at + PeerServer::CHUNK_BYTES);
-        let chunk = RangeChunk { offset: self.at as u64, data: self.blob.slice(self.at..end) };
+        let chunk = RangeChunk { data: self.blob.slice(self.at..end) };
         self.at = end;
         self.open = Some(open);
         Some((Ok(chunk), self))

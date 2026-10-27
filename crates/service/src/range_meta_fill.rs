@@ -12,9 +12,10 @@
 //! # Epochs
 //!
 //! An epoch is a group of consecutive ranges. A replica asks the node for the tree state once
-//! for each epoch. An epoch closes at 10 ranges, or when the commitments added in its ranges
-//! reach 1,000,000. The first limit that a range reaches closes the epoch. The filler reads the
-//! rows that exist in height order. Thus a restart continues the same grouping.
+//! for each epoch. An epoch closes at [`MAX_RANGES`] ranges, or when its ranges add
+//! [`MAX_COMMITMENTS`] note commitments. The first limit that a range reaches closes the epoch.
+//! The filler reads the rows that exist in height order. Thus a restart continues the same
+//! grouping.
 
 use std::{
     ops::RangeInclusive,
@@ -30,12 +31,12 @@ use zakura_chain::{
     subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
 use ztreamer_indexer::{
-    codec::{CodecError, CompactBlockRecord, TreeSizes, decode_range_record},
+    codec::{CodecError, CompactBlockRecord, RANGE_FORMAT_VERSION, TreeSizes, decode_range_record},
     index::{
         Index, IndexError, RANGE_SIZE,
         range_meta::{
-            Attested, BlobDigest, Frontiers, ManifestEntry, NodeId, PoolRoots, RangeMeta,
-            SubtreeNode, SubtreeRoot, VerifyState,
+            Attested, BlobDigest, Frontiers, MAX_COMMITMENTS, MAX_RANGES, ManifestEntry, NodeId,
+            PoolRoots, RangeMeta, SubtreeNode, SubtreeRoot, VerifyState,
         },
     },
 };
@@ -45,14 +46,12 @@ use crate::{
     backend::{BackendError, StateBackend, Subtrees, TreeState},
 };
 
-/// The range blob format version that the index writes.
-const RANGE_VERSION: u8 = 1;
 /// The number of filled ranges between two progress lines in the log.
 const LOG_EVERY: u64 = 100;
 
 /// Why a fill pass stopped.
 #[derive(Debug, thiserror::Error)]
-pub enum FillError {
+pub(crate) enum FillError {
     /// An index read or write failed.
     #[error(transparent)]
     Index(#[from] IndexError),
@@ -171,7 +170,7 @@ impl RangeMetaFiller {
         let trees = self.backend.tree_state(end.hash).await?;
         let subtree_roots = self.subtree_roots(&read).await?;
         let entry = ManifestEntry {
-            range_version: RANGE_VERSION,
+            range_version: RANGE_FORMAT_VERSION,
             start_height: start,
             end_height: end.height,
             end_hash: end.hash,
@@ -366,37 +365,26 @@ impl SubtreeSpan {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Epoch {
     /// The ranges in the epoch so far.
-    ranges: u32,
+    ranges: usize,
     /// The commitments of all pools before the first range of the epoch.
     start_commitments: u64,
 }
 
 impl Epoch {
-    /// An epoch closes at this many ranges.
-    const MAX_RANGES: u32 = 10;
-    /// An epoch closes when its ranges add this many commitments.
-    const MAX_COMMITMENTS: u64 = 1_000_000;
-
     /// Returns `true` if the next range closes the epoch. `end_tree_sizes` are the tree sizes at
     /// the end of that range.
-    fn closes_at(self, end_tree_sizes: TreeSizes) -> bool {
-        self.ranges + 1 >= Self::MAX_RANGES
-            || Self::commitments(end_tree_sizes).saturating_sub(self.start_commitments)
-                >= Self::MAX_COMMITMENTS
+    const fn closes_at(self, end_tree_sizes: TreeSizes) -> bool {
+        self.ranges + 1 >= MAX_RANGES
+            || end_tree_sizes.total().saturating_sub(self.start_commitments) >= MAX_COMMITMENTS
     }
 
     /// Adds the next range, with the `epoch_end` and `end_tree_sizes` of its row.
-    fn advance(&mut self, epoch_end: bool, end_tree_sizes: TreeSizes) {
+    const fn advance(&mut self, epoch_end: bool, end_tree_sizes: TreeSizes) {
         *self = if epoch_end {
-            Self { ranges: 0, start_commitments: Self::commitments(end_tree_sizes) }
+            Self { ranges: 0, start_commitments: end_tree_sizes.total() }
         } else {
             Self { ranges: self.ranges + 1, ..*self }
         };
-    }
-
-    /// The commitments of all pools in a tree of `sizes`.
-    fn commitments(sizes: TreeSizes) -> u64 {
-        u64::from(sizes.sapling) + u64::from(sizes.orchard) + u64::from(sizes.ironwood)
     }
 }
 

@@ -8,9 +8,9 @@ pub mod backend;
 pub mod grpc;
 pub mod p2p;
 mod project;
-pub mod range_meta_fill;
+mod range_meta_fill;
 pub mod remote;
-pub mod replicate;
+mod replicate;
 mod service;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
@@ -18,7 +18,7 @@ pub mod test_utils;
 pub use backend::{BackendError, InProcessBackend, StateBackend};
 pub use range_meta_fill::RangeMetaFiller;
 pub use remote::RemoteBackend;
-pub use replicate::ReplicatorService;
+pub use replicate::{MAX_RANGE_STREAMS, ReplicatorService};
 pub use service::{
     CompactService, HeadFollowerConfig, HeadFollowerError, Readiness, ServingSnapshot,
     SnapshotError,

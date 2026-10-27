@@ -392,7 +392,7 @@ mod tests {
     use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
     use ztreamer_indexer::{
         codec::{RangeDecoder, encode_range},
-        index::range_meta::{Attested, ManifestEntry, PoolRoots, SubtreeNode, VerifyState},
+        index::range_meta::{Attested, ManifestEntry, Pool, PoolRoots, SubtreeNode, VerifyState},
         test_utils::raw_block,
         types::RawIndexBlock,
     };
@@ -400,7 +400,6 @@ mod tests {
     use super::*;
     use crate::{
         fetch::{HttpSource, PeerSource},
-        manifest::Pool,
         range::Check,
         test_utils::{FileServer, PeerServer, SEED, Snapshot, SourceIndex},
     };
@@ -714,7 +713,7 @@ mod tests {
         let error = import.run().await.unwrap_err();
 
         let digest =
-            matches!(error, ImportError::Fetch(FetchError::Digest { start_height: 15_000 }));
+            matches!(error, ImportError::Fetch(FetchError::Digest { start_height: 15_000, .. }));
         assert!(digest, "{error:?}");
         let state = import.target.state().unwrap();
         assert_eq!((state.sealed_through(), state.verified_through()), (Some(9_999), Some(9_999)));
@@ -756,7 +755,8 @@ mod tests {
 
         let error = import.run().await.unwrap_err();
 
-        let digest = matches!(error, ImportError::Fetch(FetchError::Digest { start_height: 0 }));
+        let digest =
+            matches!(error, ImportError::Fetch(FetchError::Digest { start_height: 0, .. }));
         assert!(digest, "{error:?}");
         assert_eq!(import.target.state().unwrap().sealed_through(), None);
     }

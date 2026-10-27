@@ -23,7 +23,6 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 pasta_curves.workspace = true
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-sapling-crypto.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_with = { version = "3", features = ["hex"] }
@@ -45,6 +44,7 @@ ztreamer-remote = { path = "../remote" }
 criterion = "0.8"
 hyper = { version = "1", features = ["server"] }
 incrementalmerkletree.workspace = true
+sapling-crypto.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt", "rt-multi-thread", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }

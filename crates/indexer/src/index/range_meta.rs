@@ -32,11 +32,14 @@
 //! sampled_heights        list of u32
 //! ```
 
+use std::{array::TryFromSliceError, str::FromStr};
+
 use heed::{
     Database, RoTxn, RwTxn,
     byteorder::BigEndian,
     types::{Bytes, U32},
 };
+use hex::{FromHex, FromHexError};
 use sapling_crypto::Node as SaplingNode;
 use zakura_chain::{block, ironwood, orchard, sapling, subtree::NoteCommitmentSubtreeIndex};
 
@@ -47,9 +50,17 @@ mod wire;
 pub use wire::WireError;
 
 const FORMAT_VERSION: u8 = 1;
-const SAPLING_TAG: u8 = 0;
-const ORCHARD_TAG: u8 = 1;
-const IRONWOOD_TAG: u8 = 2;
+
+/// The version of the manifest format. The JSON manifest of a snapshot and the Replicator
+/// `ManifestEntry` message use this version.
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// The maximum number of ranges in one verification epoch.
+pub const MAX_RANGES: usize = 10;
+
+/// A verification epoch closes at the first range that makes the epoch add this number of note
+/// commitments, or more. The count includes all three pools.
+pub const MAX_COMMITMENTS: u64 = 1_000_000;
 
 /// The BLAKE3 digest of a range blob.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +70,75 @@ impl BlobDigest {
     /// Calculates the BLAKE3 digest of `blob`.
     pub fn hash(blob: &[u8]) -> Self {
         Self(*blake3::hash(blob).as_bytes())
+    }
+}
+
+/// Why a range blob does not match its [`ManifestEntry`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BlobMismatch {
+    /// The length of the blob is not `blob_len`.
+    #[error("the blob has {actual} bytes; the entry gives {expected}")]
+    Len {
+        /// The length that the entry gives.
+        expected: u64,
+        /// The length of the blob.
+        actual: u64,
+    },
+    /// The BLAKE3 digest of the blob is not `blob_digest`.
+    #[error("the blob does not have the digest that the entry gives")]
+    Digest,
+}
+
+/// A note commitment pool.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Pool {
+    /// The Sapling pool.
+    Sapling,
+    /// The Orchard pool.
+    Orchard,
+    /// The Ironwood pool.
+    Ironwood,
+}
+
+impl Pool {
+    /// The three pools.
+    pub const ALL: [Self; 3] = [Self::Sapling, Self::Orchard, Self::Ironwood];
+
+    /// The name of the pool in a snapshot manifest and in `z_getsubtreesbyindex`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sapling => "sapling",
+            Self::Orchard => "orchard",
+            Self::Ironwood => "ironwood",
+        }
+    }
+
+    /// Reads a subtree root of this pool from `bytes`. Returns `None` if the bytes are not a
+    /// node of the pool.
+    pub fn node(self, NodeBytes(bytes): NodeBytes) -> Option<SubtreeNode> {
+        match self {
+            Self::Sapling => Option::from(SaplingNode::from_bytes(bytes)).map(SubtreeNode::Sapling),
+            Self::Orchard => orchard::tree::Node::try_from(bytes).ok().map(SubtreeNode::Orchard),
+            Self::Ironwood => ironwood::tree::Node::try_from(bytes).ok().map(SubtreeNode::Ironwood),
+        }
+    }
+
+    /// The tag of the pool in the `range_meta` layout.
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Sapling => 0,
+            Self::Orchard => 1,
+            Self::Ironwood => 2,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Sapling),
+            1 => Some(Self::Orchard),
+            2 => Some(Self::Ironwood),
+            _ => None,
+        }
     }
 }
 
@@ -74,26 +154,73 @@ pub enum SubtreeNode {
 }
 
 impl SubtreeNode {
+    /// The pool of the subtree root.
+    pub const fn pool(self) -> Pool {
+        match self {
+            Self::Sapling(_) => Pool::Sapling,
+            Self::Orchard(_) => Pool::Orchard,
+            Self::Ironwood(_) => Pool::Ironwood,
+        }
+    }
+
+    /// The bytes of the subtree root. [`Pool::node`] reads them.
+    pub fn to_bytes(self) -> NodeBytes {
+        NodeBytes(match self {
+            Self::Sapling(node) => node.to_bytes(),
+            Self::Orchard(node) => node.to_repr(),
+            Self::Ironwood(node) => node.to_repr(),
+        })
+    }
+
     fn encode_into(self, bytes: &mut Vec<u8>) {
-        let (tag, node) = match self {
-            Self::Sapling(node) => (SAPLING_TAG, node.to_bytes()),
-            Self::Orchard(node) => (ORCHARD_TAG, node.to_repr()),
-            Self::Ironwood(node) => (IRONWOOD_TAG, node.to_repr()),
-        };
-        bytes.push(tag);
-        bytes.extend_from_slice(&node);
+        bytes.push(self.pool().tag());
+        bytes.extend_from_slice(self.to_bytes().as_ref());
     }
 
     fn decode_from(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         let tag = reader.u8()?;
-        let bytes: [u8; 32] = reader.array()?;
-        match tag {
-            SAPLING_TAG => Option::from(SaplingNode::from_bytes(bytes)).map(Self::Sapling),
-            ORCHARD_TAG => orchard::tree::Node::try_from(bytes).ok().map(Self::Orchard),
-            IRONWOOD_TAG => ironwood::tree::Node::try_from(bytes).ok().map(Self::Ironwood),
-            _ => None,
-        }
-        .ok_or(CodecError::InvalidRecord)
+        let bytes = NodeBytes(reader.array()?);
+        Pool::from_tag(tag).and_then(|pool| pool.node(bytes)).ok_or(CodecError::InvalidRecord)
+    }
+}
+
+/// A subtree root as 32 bytes, in the byte order of its pool. `z_getsubtreesbyindex`, the
+/// `range_meta` layout, the Replicator message and the JSON manifest use this order.
+///
+/// The bytes are not checked. [`Pool::node`] checks them and returns a [`SubtreeNode`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeBytes([u8; 32]);
+
+impl AsRef<[u8]> for NodeBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<&[u8]> for NodeBytes {
+    type Error = TryFromSliceError;
+
+    /// Refuses a slice that is not 32 bytes.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        bytes.try_into().map(Self)
+    }
+}
+
+impl TryFrom<Vec<u8>> for NodeBytes {
+    type Error = TryFromSliceError;
+
+    /// Refuses a vector that is not 32 bytes.
+    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::try_from(bytes.as_slice())
+    }
+}
+
+impl FromStr for NodeBytes {
+    type Err = FromHexError;
+
+    /// Reads 64 hex digits, as `z_getsubtreesbyindex` prints a subtree root.
+    fn from_str(hex: &str) -> Result<Self, Self::Err> {
+        <[u8; 32]>::from_hex(hex).map(Self)
     }
 }
 
@@ -186,16 +313,6 @@ pub struct ManifestEntry {
     pub blob_len: u64,
     /// Whether the range closes a verification epoch.
     pub epoch_end: bool,
-}
-
-/// A manifest entry and how far the index that serves it has proven the range. The Replicator
-/// service sends one for each range that it lists.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExportedRange {
-    /// The manifest entry for the range.
-    pub entry: ManifestEntry,
-    /// How far the serving index has proven the range.
-    pub state: VerifyState,
 }
 
 /// The node that verified a range.
@@ -313,6 +430,16 @@ impl RangeMeta {
 }
 
 impl ManifestEntry {
+    /// Checks that `blob` has the length and the BLAKE3 digest of the entry. It checks the length
+    /// first, because the digest reads the full blob.
+    pub fn check_blob(&self, blob: &[u8]) -> Result<(), BlobMismatch> {
+        let actual = blob.len() as u64;
+        if actual != self.blob_len {
+            return Err(BlobMismatch::Len { expected: self.blob_len, actual });
+        }
+        (BlobDigest::hash(blob) == self.blob_digest).then_some(()).ok_or(BlobMismatch::Digest)
+    }
+
     fn encode_into(&self, bytes: &mut Vec<u8>) {
         bytes.push(self.range_version);
         bytes.extend_from_slice(&self.start_height.to_be_bytes());
@@ -652,6 +779,32 @@ mod tests {
         let mut bad_flag = bytes;
         bad_flag[entry_len] = 2;
         assert_eq!(RangeMeta::decode(&bad_flag), Err(CodecError::InvalidRecord));
+    }
+
+    #[test]
+    fn node_bytes_are_32_bytes_or_64_hex_digits() {
+        let bytes = NodeBytes([0xab; 32]);
+        assert_eq!("ab".repeat(32).parse(), Ok(bytes));
+        assert_eq!(NodeBytes::try_from(vec![0xab; 32]).unwrap(), bytes);
+        assert!("ab".repeat(31).parse::<NodeBytes>().is_err());
+        assert!("zz".repeat(32).parse::<NodeBytes>().is_err());
+        assert!(NodeBytes::try_from(vec![0xab; 33]).is_err());
+    }
+
+    #[test]
+    fn check_blob_compares_the_length_then_the_digest() {
+        let blob = b"range blob";
+        let entry = ManifestEntry {
+            blob_digest: BlobDigest::hash(blob),
+            blob_len: blob.len() as u64,
+            ..bare_meta(0).entry
+        };
+        assert_eq!(entry.check_blob(blob), Ok(()));
+        assert_eq!(
+            entry.check_blob(&blob[1..]),
+            Err(BlobMismatch::Len { expected: 10, actual: 9 })
+        );
+        assert_eq!(entry.check_blob(b"other blob"), Err(BlobMismatch::Digest));
     }
 
     #[test]
