@@ -7,15 +7,16 @@
 //! one [`Attested`] record per range, which the importer keeps in `range_meta`.
 //!
 //! [`JsonRpcAttestor`] asks a zakura node over JSON-RPC. `z_gettreestate` takes 0.2 to 2.6 s and
-//! the node does not cache it, so the attestor keeps the answers that it gave: a retry of an
-//! epoch makes no new call.
+//! the node does not cache it, so the attestor keeps the tree roots that it gave: a retry of an
+//! epoch makes no new `z_gettreestate` call. The other two calls take less than a millisecond.
 
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use async_trait::async_trait;
+use tokio::sync::OnceCell;
 use zakura_chain::{block, subtree::NoteCommitmentSubtreeIndex};
 use zakura_rpc::client::Commitments;
 use zakura_state::HashOrHeight;
@@ -34,7 +35,7 @@ use crate::{
     range::{Check, Reject},
 };
 
-/// The most answers of each kind that a [`JsonRpcAttestor`] keeps.
+/// The most `z_gettreestate` answers that a [`JsonRpcAttestor`] keeps.
 pub const CACHE_CAPACITY: usize = 1024;
 
 /// Why a node gave no answer.
@@ -256,10 +257,11 @@ impl Epoch<'_> {
     }
 }
 
-/// An [`Attestor`] that asks a zakura node over JSON-RPC, and keeps the answers.
+/// An [`Attestor`] that asks a zakura node over JSON-RPC, and keeps the tree roots.
 ///
-/// It keeps up to [`CACHE_CAPACITY`] answers of each kind. When a map is full, it drops the
-/// answer for the lowest height or subtree index.
+/// It keeps up to [`CACHE_CAPACITY`] `z_gettreestate` answers. When the map is full, it drops
+/// the answer for the lowest height. Calls for one height at the same time make one
+/// `z_gettreestate` call.
 ///
 /// ```no_run
 /// use ztreamer_remote::{RpcClient, ZakuraClient};
@@ -276,44 +278,85 @@ impl Epoch<'_> {
 #[derive(Debug)]
 pub struct JsonRpcAttestor {
     node: ZakuraClient,
-    hashes: Answers<u32, block::Hash>,
-    roots: Answers<u32, PoolRoots>,
-    subtrees: Answers<(Pool, NoteCommitmentSubtreeIndex), SubtreeNode>,
+    /// The tree roots by height. A cell is empty until a call for its height succeeds. The map
+    /// drops its lowest height when it is full.
+    roots: Mutex<BTreeMap<u32, Arc<OnceCell<PoolRoots>>>>,
 }
 
 impl JsonRpcAttestor {
     /// An attestor with no answers yet.
     pub const fn new(node: ZakuraClient) -> Self {
-        Self { node, hashes: Answers::new(), roots: Answers::new(), subtrees: Answers::new() }
+        Self { node, roots: Mutex::new(BTreeMap::new()) }
+    }
+
+    /// The map of the tree roots. The map is valid after a panic, because no change leaves it
+    /// half done.
+    fn lock_roots(&self) -> MutexGuard<'_, BTreeMap<u32, Arc<OnceCell<PoolRoots>>>> {
+        self.roots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cell of the tree roots at `height`. A new cell is empty. Before it adds a cell to a
+    /// full map, it drops the filled cells of the lowest heights. It never drops a cell that a
+    /// call still fills.
+    fn tree_roots_cell(&self, height: u32) -> Arc<OnceCell<PoolRoots>> {
+        let mut map = self.lock_roots();
+        if let Some(cell) = map.get(&height) {
+            return Arc::clone(cell);
+        }
+        while map.len() >= CACHE_CAPACITY {
+            let Some(lowest) = map
+                .iter()
+                .find(|(_, cell)| cell.initialized())
+                .map(|(&kept_height, _)| kept_height)
+            else {
+                break;
+            };
+            map.remove(&lowest);
+        }
+        Arc::clone(map.entry(height).or_default())
+    }
+
+    /// Removes the cell of a failed call at `height`, when the cell is still empty and no other
+    /// call holds it. Thus a failed call keeps no place in the map.
+    fn forget_failed_cell(&self, height: u32, cell: &Arc<OnceCell<PoolRoots>>) {
+        let mut map = self.lock_roots();
+        // The map and `cell` are the two holders. Another call gets a holder only under the lock.
+        let unused = map.get(&height).is_some_and(|kept| {
+            Arc::ptr_eq(kept, cell) && !kept.initialized() && Arc::strong_count(kept) == 2
+        });
+        if unused {
+            map.remove(&height);
+        }
+    }
+
+    /// Asks the node for the tree roots at `height` with `z_gettreestate`.
+    async fn ask_tree_roots(&self, height: u32) -> Result<PoolRoots, NodeError> {
+        let state = self.node.z_get_treestate(HashOrHeight::Height(block::Height(height))).await?;
+        let actual = state.height().0;
+        if actual != height {
+            return Err(NodeError::Height { expected: height, actual });
+        }
+        Ok(PoolRoots {
+            sapling: final_root(Pool::Sapling, state.sapling().commitments())?,
+            orchard: final_root(Pool::Orchard, state.orchard().commitments())?,
+            ironwood: final_root(Pool::Ironwood, state.ironwood().commitments())?,
+        })
     }
 }
 
 #[async_trait]
 impl Attestor for JsonRpcAttestor {
     async fn block_hash(&self, height: u32) -> Result<block::Hash, NodeError> {
-        self.hashes
-            .get_or_ask(height, || async {
-                Ok(self.node.get_block_hash(block::Height(height)).await?.hash())
-            })
-            .await
+        Ok(self.node.get_block_hash(block::Height(height)).await?.hash())
     }
 
     async fn tree_roots(&self, height: u32) -> Result<PoolRoots, NodeError> {
-        self.roots
-            .get_or_ask(height, || async {
-                let state =
-                    self.node.z_get_treestate(HashOrHeight::Height(block::Height(height))).await?;
-                let actual = state.height().0;
-                if actual != height {
-                    return Err(NodeError::Height { expected: height, actual });
-                }
-                Ok(PoolRoots {
-                    sapling: final_root(Pool::Sapling, state.sapling().commitments())?,
-                    orchard: final_root(Pool::Orchard, state.orchard().commitments())?,
-                    ironwood: final_root(Pool::Ironwood, state.ironwood().commitments())?,
-                })
-            })
-            .await
+        let cell = self.tree_roots_cell(height);
+        let roots = cell.get_or_try_init(|| self.ask_tree_roots(height)).await.copied();
+        if roots.is_err() {
+            self.forget_failed_cell(height, &cell);
+        }
+        roots
     }
 
     async fn subtree_roots(
@@ -322,24 +365,19 @@ impl Attestor for JsonRpcAttestor {
         start: NoteCommitmentSubtreeIndex,
         count: u16,
     ) -> Result<Vec<SubtreeNode>, NodeError> {
-        let keys = (0..count)
-            .map(|offset| {
-                start.0.checked_add(offset).map(|index| (pool, NoteCommitmentSubtreeIndex(index)))
-            })
+        let indices = (0..count)
+            .map(|offset| start.0.checked_add(offset).map(NoteCommitmentSubtreeIndex))
             .collect::<Option<Vec<_>>>()
             .ok_or(NodeError::MissingSubtree { pool, index: start })?;
-        if let Some(known) = self.subtrees.known(&keys) {
-            return Ok(known);
-        }
         let limit = Some(NoteCommitmentSubtreeIndex(count));
         let response = self.node.z_get_subtrees_by_index(pool.as_str(), start, limit).await?;
         if response.start_index() != start {
             return Err(NodeError::MissingSubtree { pool, index: start });
         }
-        let roots = keys
-            .iter()
+        indices
+            .into_iter()
             .enumerate()
-            .map(|(offset, &(_, index))| {
+            .map(|(offset, index)| {
                 let subtree = response
                     .subtrees()
                     .get(offset)
@@ -350,9 +388,7 @@ impl Attestor for JsonRpcAttestor {
                     .and_then(|bytes| pool.subtree_node(bytes))
                     .ok_or(NodeError::SubtreeRoot { pool, index })
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.subtrees.keep(keys.into_iter().zip(roots.iter().copied()));
-        Ok(roots)
+            .collect()
     }
 }
 
@@ -366,49 +402,6 @@ fn final_root<R: FromRpc>(pool: Pool, commitments: &Commitments) -> Result<Optio
         }
         (None, Some(_)) => Err(NodeError::MissingRoot { pool }),
         (None, None) => Ok(None),
-    }
-}
-
-/// Answers that a node gave, by key. The map drops its lowest key when it is full.
-#[derive(Debug)]
-struct Answers<K, V>(Mutex<BTreeMap<K, V>>);
-
-impl<K: Ord + Copy, V: Copy> Answers<K, V> {
-    const fn new() -> Self {
-        Self(Mutex::new(BTreeMap::new()))
-    }
-
-    /// The map. The map is valid after a panic, because each change is one call.
-    fn map(&self) -> MutexGuard<'_, BTreeMap<K, V>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The answers for all of `keys`, in order, or `None` if the map does not have one of them.
-    fn known(&self, keys: &[K]) -> Option<Vec<V>> {
-        let map = self.map();
-        keys.iter().map(|key| map.get(key).copied()).collect()
-    }
-
-    /// Keeps `answers`, and drops the lowest keys above [`CACHE_CAPACITY`].
-    fn keep(&self, answers: impl IntoIterator<Item = (K, V)>) {
-        let mut map = self.map();
-        map.extend(answers);
-        while map.len() > CACHE_CAPACITY {
-            map.pop_first();
-        }
-    }
-
-    /// The answer for `key`. If the map does not have it, `ask` gives it and the map keeps it.
-    async fn get_or_ask<F>(&self, key: K, ask: impl FnOnce() -> F) -> Result<V, NodeError>
-    where
-        F: Future<Output = Result<V, NodeError>>,
-    {
-        if let Some(&[value]) = self.known(&[key]).as_deref() {
-            return Ok(value);
-        }
-        let value = ask().await?;
-        self.keep([(key, value)]);
-        Ok(value)
     }
 }
 
@@ -653,19 +646,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_rpc_attestor_asks_the_node_once() {
+    async fn json_rpc_attestor_asks_the_node_once_for_the_tree_roots() {
         let (node, attestor) = json_rpc_attestor(treestate(2_999)).await;
 
-        for _ in 0..2 {
-            attestor.tree_roots(2_999).await.unwrap();
-            attestor.block_hash(2_999).await.unwrap();
-            attestor.subtree_roots(Pool::Sapling, SUBTREE, 2).await.unwrap();
-        }
-        // The answers of the batch also answer a part of it.
-        let six = NoteCommitmentSubtreeIndex(6);
-        assert_eq!(attestor.subtree_roots(Pool::Sapling, six, 1).await.unwrap(), [sapling_node(2)]);
+        // Two calls at the same time, then a retry.
+        let (first, second) = tokio::join!(attestor.tree_roots(2_999), attestor.tree_roots(2_999));
+        assert_eq!((first.unwrap(), second.unwrap()), (roots(), roots()));
+        attestor.tree_roots(2_999).await.unwrap();
 
-        assert_eq!(node.seen().len(), 3);
+        assert_eq!(node.seen().len(), 1);
     }
 
     #[tokio::test]
@@ -681,11 +670,33 @@ mod tests {
 
     #[tokio::test]
     async fn json_rpc_attestor_rejects_an_answer_for_another_height() {
-        let (_node, attestor) = json_rpc_attestor(treestate(2_998)).await;
+        let (node, attestor) = json_rpc_attestor(treestate(2_998)).await;
 
         let error = attestor.tree_roots(2_999).await.unwrap_err();
 
         assert!(matches!(error, NodeError::Height { expected: 2_999, actual: 2_998 }), "{error:?}");
+        // The attestor keeps no failed answer: a retry asks the node again.
+        assert!(attestor.lock_roots().is_empty());
+        attestor.tree_roots(2_999).await.unwrap_err();
+        assert_eq!(node.seen().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_full_json_rpc_attestor_drops_the_lowest_filled_height() {
+        let (_node, attestor) = json_rpc_attestor(treestate(2_999)).await;
+        let filled = || Arc::new(OnceCell::new_with(Some(roots())));
+        let heights = (0..CACHE_CAPACITY as u32).map(|at| 10_000 + at);
+        attestor.lock_roots().extend(heights.map(|height| (height, filled())));
+        // A call fills the cell of the lowest height. The map must not drop it.
+        attestor.lock_roots().insert(9_000, Arc::new(OnceCell::new()));
+        attestor.lock_roots().remove(&(10_000 + CACHE_CAPACITY as u32 - 1));
+
+        attestor.tree_roots(2_999).await.unwrap();
+
+        let map = attestor.lock_roots();
+        assert_eq!(map.len(), CACHE_CAPACITY);
+        assert!(map.contains_key(&2_999) && map.contains_key(&9_000));
+        assert!(!map.contains_key(&10_000) && map.contains_key(&10_001));
     }
 
     #[tokio::test]
