@@ -6,8 +6,10 @@
 //!
 //! Each request reads the index at the generation of the current serving snapshot. If the index
 //! has moved to a different generation, the request fails with `UNAVAILABLE`, and the client tries
-//! again. Each LMDB read runs on a blocking thread. At most [`MAX_RANGE_STREAMS`] `GetRange`
-//! streams run at a time, because each one holds its blob in memory.
+//! again. `GetRange` reads the `range_meta` row and the blob in one LMDB snapshot, so the row that
+//! it checks is the row of the blob that it sends. Each LMDB read runs on a blocking thread. At
+//! most [`MAX_RANGE_STREAMS`] `GetRange` streams run at a time, because each one holds its blob in
+//! memory.
 
 use std::sync::Arc;
 
@@ -134,17 +136,10 @@ impl Replicator for ReplicatorService {
             Status::resource_exhausted(format!("{MAX_RANGE_STREAMS} range streams are running"))
         })?;
         let blob = self
-            .read(move |index| {
-                let listed = index
-                    .range_meta(start)?
-                    .is_some_and(|meta| meta.state != VerifyState::Rejected);
-                if !listed {
-                    return Ok(None);
-                }
-                index.read_sealed_range_bytes_at(generation, start)
-            })
+            .read(move |index| index.read_sealed_range_with_meta_at(generation, start))
             .await?
-            .map(Bytes::from)
+            .filter(|range| range.meta.state != VerifyState::Rejected)
+            .map(|range| Bytes::from(range.blob))
             .ok_or_else(|| {
                 Status::not_found(format!("no listed sealed range starts at {start}"))
             })?;

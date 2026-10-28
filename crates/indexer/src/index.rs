@@ -163,6 +163,15 @@ pub struct ChainIdentity {
     pub genesis_hash: block::Hash,
 }
 
+/// The metadata row and the packed blob of one sealed range, from one LMDB snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedRangeWithMeta {
+    /// The `range_meta` row of the range.
+    pub meta: RangeMeta,
+    /// The packed blob of the range, as in `sealed_ranges`.
+    pub blob: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Represents the [`Index`]'s current sync state.
 pub struct IndexState {
@@ -416,6 +425,23 @@ impl Index {
         let txn = self.env.read_txn()?;
         self.read_generation(&txn, generation)?;
         self.sealed_range_bytes_in(&txn, start)
+    }
+
+    /// Reads the `range_meta` row and the packed blob of the sealed range that starts at `start`
+    /// from one generation-pinned LMDB snapshot. Thus a commit between two reads cannot give a
+    /// row and a blob of different commits. Returns `None` if the range has no row.
+    pub fn read_sealed_range_with_meta_at(
+        &self,
+        generation: u64,
+        start: u32,
+    ) -> Result<Option<SealedRangeWithMeta>, IndexError> {
+        let txn = self.env.read_txn()?;
+        self.read_generation(&txn, generation)?;
+        let Some(meta) = self.tables.range_meta.get(&txn, start)? else {
+            return Ok(None);
+        };
+        let blob = self.sealed_range_bytes_in(&txn, start)?;
+        Ok(blob.map(|blob| SealedRangeWithMeta { meta, blob }))
     }
 
     fn sealed_range_bytes_in(
@@ -1015,6 +1041,25 @@ mod tests {
         ));
         assert!(matches!(
             index.read_sealed_range_bytes_at(other, 0),
+            Err(IndexError::Generation { .. })
+        ));
+    }
+
+    /// One pinned read gives the row and the blob of a range. A range with no row gives `None`.
+    #[test]
+    fn a_pinned_range_read_gives_the_row_and_the_blob_of_one_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, state) = index_with_two_range_metas(dir.path());
+        let generation = state.generation();
+
+        let range = index.read_sealed_range_with_meta_at(generation, 1_000).unwrap().unwrap();
+        assert_eq!(range.meta, full_meta(1_000));
+        assert_eq!(Some(range.blob), index.read_sealed_range_bytes(1_000).unwrap());
+        for start in [500, 2_000] {
+            assert_eq!(index.read_sealed_range_with_meta_at(generation, start).unwrap(), None);
+        }
+        assert!(matches!(
+            index.read_sealed_range_with_meta_at(generation + 1, 0),
             Err(IndexError::Generation { .. })
         ));
     }
