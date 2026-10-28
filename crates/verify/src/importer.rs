@@ -46,20 +46,23 @@
 
 mod epoch_import;
 
-use std::{future, num::NonZeroUsize, panic, pin, sync::Arc, thread};
+use std::{future, num::NonZeroUsize, pin, sync::Arc, thread};
 
 use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use tokio::sync::{Semaphore, watch};
 use tracing::{Instrument as _, info};
 use zakura_chain::{block, parameters::Network};
-use ztreamer_indexer::index::{
-    Index, IndexError, IndexState, RANGE_SIZE,
-    range_meta::{Frontiers, NodeId},
+use ztreamer_indexer::{
+    blocking::{BlockingTask, BlockingTaskCancelled},
+    index::{
+        Index, IndexError, IndexState, RANGE_SIZE,
+        range_meta::{Frontiers, NodeId},
+    },
 };
 
 use self::epoch_import::EpochImport;
 use crate::{
-    attest::{Attestor, EpochError},
+    attest::{Attestor, EpochError, NodeError},
     epoch::Epoch,
     fetch::{FetchError, Fetcher, RangeSource},
     manifest::Manifest,
@@ -147,6 +150,9 @@ pub enum ImportError {
     /// An index read or install failed.
     #[error(transparent)]
     Index(#[from] IndexError),
+    /// The blocking pool stopped before a blocking task of the import ran.
+    #[error(transparent)]
+    Cancelled(#[from] BlockingTaskCancelled),
     /// The manifest is for another network.
     #[error("manifest is for network {manifest}, the index for {index}")]
     Network {
@@ -193,6 +199,19 @@ pub enum ImportError {
         #[source]
         source: EpochError,
     },
+}
+
+impl ImportError {
+    /// The error for `source` in the epoch through `epoch`. A cancel of a blocking task is
+    /// [`ImportError::Cancelled`], not a failure of the epoch: the runtime stops.
+    pub(crate) fn from_epoch_error(epoch: u32, source: EpochError) -> Self {
+        match source {
+            EpochError::Node { source: NodeError::Cancelled(cancelled), .. } => {
+                Self::Cancelled(cancelled)
+            }
+            source => Self::Epoch { epoch, source },
+        }
+    }
 }
 
 /// Installs the sealed ranges of one source in an index, in verified epochs.
@@ -344,9 +363,7 @@ impl Importer {
         call: impl FnOnce(&Index) -> Result<T, IndexError> + Send + 'static,
     ) -> Result<T, ImportError> {
         let index = Arc::clone(&self.index);
-        Ok(tokio::task::spawn_blocking(move || call(&index))
-            .await
-            .unwrap_or_else(|error| panic::resume_unwind(error.into_panic()))?)
+        Ok(BlockingTask::spawn(move || call(&index)).join().await??)
     }
 }
 
@@ -750,5 +767,17 @@ mod tests {
         let error =
             import.importer(import.fake_attestor(None), testnet).run(shutdown).await.unwrap_err();
         assert!(matches!(error, ImportError::Network { .. }), "{error:?}");
+    }
+
+    /// A cancel in the node work of an epoch is a stop, the same as a cancel in an index read.
+    #[test]
+    fn a_cancel_in_an_epoch_is_a_cancel_of_the_import() {
+        let cancelled =
+            EpochError::Node { height: 2_999, source: NodeError::Cancelled(BlockingTaskCancelled) };
+        let error = ImportError::from_epoch_error(2_999, cancelled);
+        assert!(matches!(error, ImportError::Cancelled(BlockingTaskCancelled)), "{error:?}");
+        let reject = Reject::BlobCount { entries: 1, blobs: 0 };
+        let error = ImportError::from_epoch_error(2_999, reject.into());
+        assert!(matches!(error, ImportError::Epoch { epoch: 2_999, .. }), "{error:?}");
     }
 }

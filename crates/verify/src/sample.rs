@@ -6,12 +6,11 @@
 //! asks the node for the full block at each height, parses it with the parser of the indexer, and
 //! compares the record byte for byte with the record in the blob.
 
-use std::panic;
-
 use async_trait::async_trait;
 use rand::{SeedableRng, rngs::StdRng, seq::index};
 use ztreamer_indexer::{
-    codec::RangeDecoder, index::RANGE_SIZE, parser::parse_block, types::RawIndexBlock,
+    blocking::BlockingTask, codec::RangeDecoder, index::RANGE_SIZE, parser::parse_block,
+    types::RawIndexBlock,
 };
 use ztreamer_remote::ZakuraClient;
 
@@ -112,7 +111,7 @@ impl Epoch<'_> {
                     decoder.record(offset as usize).map_err(|_| Check::Decode.at(height))?;
                 let node = |source| EpochError::Node { height, source };
                 let block = sampler.full_block(height).await.map_err(node)?;
-                let same = tokio::task::spawn_blocking(move || -> Result<bool, NodeError> {
+                let same = BlockingTask::spawn(move || -> Result<bool, NodeError> {
                     // `Epoch::verify` checked that each record adds its own commitments. Thus
                     // the tree sizes before the block are the end sizes minus the additions.
                     let Some(before) = record.end_tree_sizes.checked_sub(record.additions()) else {
@@ -124,8 +123,8 @@ impl Epoch<'_> {
                     let expected = expected.encode()?;
                     Ok(record.encode().is_ok_and(|bytes| bytes == expected))
                 })
+                .join_flattened()
                 .await
-                .unwrap_or_else(|error| panic::resume_unwind(error.into_panic()))
                 .map_err(node)?;
                 if !same {
                     return Err(Check::SampledBlock.at(height).into());

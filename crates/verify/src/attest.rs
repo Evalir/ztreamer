@@ -21,11 +21,12 @@ use zakura_chain::{block, subtree::NoteCommitmentSubtreeIndex};
 use zakura_rpc::client::Commitments;
 use zakura_state::HashOrHeight;
 use ztreamer_indexer::{
+    blocking::BlockingTaskCancelled,
     codec::CodecError,
     frontier::{FromRpc, RpcDecodeError},
     index::range_meta::{Attested, NodeBytes, Pool, PoolRoots, SubtreeNode},
     parser::CompactParseError,
-    types::{BlockAtHeightError, RawBlockError},
+    types::{BlockAtHeightError, FetchAtHeightError, RawBlockError},
 };
 use ztreamer_remote::{RpcError, ZakuraClient};
 
@@ -37,7 +38,7 @@ use crate::{
 /// The most `z_gettreestate` answers that a [`JsonRpcAttestor`] keeps.
 pub const CACHE_CAPACITY: usize = 1024;
 
-/// Why a node gave no answer.
+/// Why a node call gave no answer.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     /// The call to the node failed.
@@ -92,6 +93,11 @@ pub enum NodeError {
     /// The record of the node block does not encode.
     #[error("record of the node block does not encode")]
     Encode(#[from] CodecError),
+    /// The blocking pool stopped before the local work on the answer ran. The runtime stops;
+    /// the node is not at fault. The importer gives
+    /// [`ImportError::Cancelled`](crate::importer::ImportError::Cancelled) for it.
+    #[error(transparent)]
+    Cancelled(#[from] BlockingTaskCancelled),
 }
 
 impl From<BlockAtHeightError> for NodeError {
@@ -100,6 +106,15 @@ impl From<BlockAtHeightError> for NodeError {
             BlockAtHeightError::Rpc(error) => Self::Rpc(error),
             BlockAtHeightError::Decode { source, .. } => Self::RawBlock(source),
             BlockAtHeightError::Height { expected, actual } => Self::Height { expected, actual },
+        }
+    }
+}
+
+impl From<FetchAtHeightError> for NodeError {
+    fn from(error: FetchAtHeightError) -> Self {
+        match error {
+            FetchAtHeightError::Block(error) => error.into(),
+            FetchAtHeightError::Cancelled(error) => Self::Cancelled(error),
         }
     }
 }
@@ -790,5 +805,14 @@ mod tests {
         let sapling_only =
             PoolRoots { sapling: empty_tree_roots().sapling, ..PoolRoots::default() };
         assert!(attested.iter().all(|record| record.roots == sapling_only), "{attested:?}");
+    }
+
+    #[test]
+    fn a_fetch_error_keeps_its_cause_in_the_node_error() {
+        let cancelled = NodeError::from(FetchAtHeightError::Cancelled(BlockingTaskCancelled));
+        assert!(matches!(cancelled, NodeError::Cancelled(BlockingTaskCancelled)));
+        let height = BlockAtHeightError::Height { expected: 3, actual: 4 };
+        let height = NodeError::from(FetchAtHeightError::Block(height));
+        assert!(matches!(height, NodeError::Height { expected: 3, actual: 4 }));
     }
 }
