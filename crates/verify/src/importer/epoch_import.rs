@@ -140,7 +140,9 @@ impl EpochImport {
         let _permit =
             self.verify_permits.acquire().await.expect("the verify permits are never closed");
         let (run, span) = (Arc::clone(self), Span::current());
-        BlockingTask::spawn(move || span.in_scope(|| run.verify_blobs(at, blobs))).join().await?
+        BlockingTask::spawn(move || span.in_scope(|| run.verify_blobs(at, blobs)))
+            .join_flattened()
+            .await
     }
 
     /// Runs [`Epoch::verify`] for the epoch at `at`, and gives the checked range of each blob.
@@ -175,7 +177,7 @@ impl EpochImport {
         let attest = epoch.attest(&proof, &*node.attestor);
         let sample = epoch.sample(&ranges, &*node.sampler, self.importer.config.verify_sample);
         let (attested, sampled) = tokio::join!(attest, sample);
-        let in_epoch = |source| ImportError::Epoch { epoch: epoch.end_height(), source };
+        let in_epoch = |source| ImportError::from_epoch_error(epoch.end_height(), source);
         let (attested, sampled) = (attested.map_err(in_epoch)?, sampled.map_err(in_epoch)?);
 
         let verified_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();

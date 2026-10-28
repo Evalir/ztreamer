@@ -1,8 +1,9 @@
 //! Work on the Tokio blocking thread pool.
 //!
-//! [`BlockingTask`] owns the join rule for the blocking work of the workspace. A panic in the
-//! closure continues on the caller. A closure that the runtime does not run gives
-//! [`BlockingTaskCancelled`]. `JoinError::into_panic` panics on a cancel, thus it gives no
+//! [`BlockingTask`] is the join rule for blocking work that must keep a panic of the closure.
+//! A panic in the closure continues on the caller. A closure that the runtime does not run gives
+//! [`BlockingTaskCancelled`]. Other `spawn_blocking` sites of the workspace still join with
+//! their own rule. `JoinError::into_panic` panics on a cancel, thus it gives no
 //! error for the caller to return.
 //!
 //! The blocking pool cancels a closure that starts after the pool stopped. When a runtime
@@ -52,6 +53,16 @@ impl<T: Send + 'static> BlockingTask<T> {
     }
 }
 
+impl<U: Send + 'static, E: From<BlockingTaskCancelled> + Send + 'static>
+    BlockingTask<Result<U, E>>
+{
+    /// [`Self::join`] for a closure that returns a `Result`. A cancel goes into the error type of
+    /// the closure.
+    pub async fn join_flattened(self) -> Result<U, E> {
+        self.join().await?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::runtime::{Builder, Runtime};
@@ -87,5 +98,28 @@ mod tests {
 
         let caller = current_thread_runtime();
         assert_eq!(caller.block_on(task.join()).unwrap_err(), BlockingTaskCancelled);
+    }
+
+    #[test]
+    fn join_flattened_puts_a_cancel_in_the_error_of_the_closure() {
+        let stopped = current_thread_runtime();
+        let handle = stopped.handle().clone();
+        stopped.shutdown_background();
+        let task = {
+            let _context = handle.enter();
+            BlockingTask::spawn(|| Ok::<_, BlockingTaskCancelled>(7))
+        };
+
+        let caller = current_thread_runtime();
+        assert_eq!(caller.block_on(task.join_flattened()), Err(BlockingTaskCancelled));
+        assert_eq!(caller.block_on(spawn_on(&caller, || Ok(7)).join_flattened()), Ok(7));
+    }
+
+    fn spawn_on<T: Send + 'static>(
+        runtime: &Runtime,
+        work: impl FnOnce() -> Result<T, BlockingTaskCancelled> + Send + 'static,
+    ) -> BlockingTask<Result<T, BlockingTaskCancelled>> {
+        let _context = runtime.enter();
+        BlockingTask::spawn(work)
     }
 }

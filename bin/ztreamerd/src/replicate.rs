@@ -194,6 +194,11 @@ impl Replica {
                 info!(%error, "the import cannot start at the index tip; the tail continues");
                 return Ok(ControlFlow::Continue(()));
             }
+            // The blocking pool stopped: the runtime stops, as after `report.stopped`.
+            Err(error @ ImportError::Cancelled(_)) => {
+                info!(%error, "the import stops");
+                return Ok(ControlFlow::Break(()));
+            }
             result => result.wrap_err("import the sealed ranges")?,
         };
         info!(?report, "import complete");

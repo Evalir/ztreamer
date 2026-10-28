@@ -62,7 +62,7 @@ use ztreamer_indexer::{
 
 use self::epoch_import::EpochImport;
 use crate::{
-    attest::{Attestor, EpochError},
+    attest::{Attestor, EpochError, NodeError},
     epoch::Epoch,
     fetch::{FetchError, Fetcher, RangeSource},
     manifest::Manifest,
@@ -199,6 +199,19 @@ pub enum ImportError {
         #[source]
         source: EpochError,
     },
+}
+
+impl ImportError {
+    /// The error for `source` in the epoch through `epoch`. A cancel of a blocking task is
+    /// [`ImportError::Cancelled`], not a failure of the epoch: the runtime stops.
+    pub(crate) fn from_epoch_error(epoch: u32, source: EpochError) -> Self {
+        match source {
+            EpochError::Node { source: NodeError::Cancelled(cancelled), .. } => {
+                Self::Cancelled(cancelled)
+            }
+            source => Self::Epoch { epoch, source },
+        }
+    }
 }
 
 /// Installs the sealed ranges of one source in an index, in verified epochs.
@@ -754,5 +767,17 @@ mod tests {
         let error =
             import.importer(import.fake_attestor(None), testnet).run(shutdown).await.unwrap_err();
         assert!(matches!(error, ImportError::Network { .. }), "{error:?}");
+    }
+
+    /// A cancel in the node work of an epoch is a stop, the same as a cancel in an index read.
+    #[test]
+    fn a_cancel_in_an_epoch_is_a_cancel_of_the_import() {
+        let cancelled =
+            EpochError::Node { height: 2_999, source: NodeError::Cancelled(BlockingTaskCancelled) };
+        let error = ImportError::from_epoch_error(2_999, cancelled);
+        assert!(matches!(error, ImportError::Cancelled(BlockingTaskCancelled)), "{error:?}");
+        let reject = Reject::BlobCount { entries: 1, blobs: 0 };
+        let error = ImportError::from_epoch_error(2_999, reject.into());
+        assert!(matches!(error, ImportError::Epoch { epoch: 2_999, .. }), "{error:?}");
     }
 }

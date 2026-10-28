@@ -12,7 +12,9 @@ use crate::{
     ingest::{IngestError, OrderedBuilder},
     parser::{CompactParseError, parse_block},
     pipeline::PipelineConfig,
-    types::{BlockAtHeightError, ParsedCompactBlock, RawBlockError, RawIndexBlock},
+    types::{
+        BlockAtHeightError, FetchAtHeightError, ParsedCompactBlock, RawBlockError, RawIndexBlock,
+    },
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -57,7 +59,15 @@ impl From<BlockAtHeightError> for HeadError {
             BlockAtHeightError::Rpc(error) => Self::Remote(error),
             BlockAtHeightError::Decode { source, .. } => source.into(),
             BlockAtHeightError::Height { expected, actual } => Self::Height { expected, actual },
-            BlockAtHeightError::Cancelled(error) => Self::Cancelled(error),
+        }
+    }
+}
+
+impl From<FetchAtHeightError> for HeadError {
+    fn from(error: FetchAtHeightError) -> Self {
+        match error {
+            FetchAtHeightError::Block(error) => error.into(),
+            FetchAtHeightError::Cancelled(error) => Self::Cancelled(error),
         }
     }
 }
@@ -807,5 +817,16 @@ mod tests {
         let mut hash = hash(height);
         hash.0[31] = 1;
         hash
+    }
+
+    #[test]
+    fn a_fetch_error_keeps_its_cause_in_the_head_error() {
+        use crate::blocking::BlockingTaskCancelled;
+
+        let cancelled = HeadError::from(FetchAtHeightError::Cancelled(BlockingTaskCancelled));
+        assert!(matches!(cancelled, HeadError::Cancelled(BlockingTaskCancelled)));
+        let height = BlockAtHeightError::Height { expected: 3, actual: 4 };
+        let height = HeadError::from(FetchAtHeightError::Block(height));
+        assert!(matches!(height, HeadError::Height { expected: 3, actual: 4 }));
     }
 }

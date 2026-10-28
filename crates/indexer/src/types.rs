@@ -39,8 +39,8 @@ pub enum RawBlockError {
     Serialize(io::Error),
 }
 
-/// Why [`RawIndexBlock::fetch_at_height`] or [`RawIndexBlock::from_bytes_at_height`] gave no
-/// block.
+/// Why [`RawIndexBlock::from_bytes_at_height`] gave no block, or why the node or the bytes of
+/// [`RawIndexBlock::fetch_at_height`] gave no block.
 #[derive(Debug, thiserror::Error)]
 pub enum BlockAtHeightError {
     /// The `getblock` call failed. [`RpcError::is_block_not_found`] is `true` when the node has
@@ -53,6 +53,14 @@ pub enum BlockAtHeightError {
     /// The block for height `expected` has the coinbase height `actual`.
     #[error("block for height {expected} is at height {actual}")]
     Height { expected: u32, actual: u32 },
+}
+
+/// Why [`RawIndexBlock::fetch_at_height`] gave no block.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchAtHeightError {
+    /// The `getblock` call failed, or the bytes do not give the block at the height.
+    #[error(transparent)]
+    Block(#[from] BlockAtHeightError),
     /// The blocking pool stopped before the decode ran.
     #[error(transparent)]
     Cancelled(#[from] BlockingTaskCancelled),
@@ -64,9 +72,13 @@ impl RawIndexBlock {
     pub async fn fetch_at_height(
         node: &ZakuraClient,
         height: u32,
-    ) -> Result<Self, BlockAtHeightError> {
-        let bytes = node.get_block_raw(HashOrHeight::Height(block::Height(height))).await?.0;
-        BlockingTask::spawn(move || Self::from_bytes_at_height(bytes, height)).join().await?
+    ) -> Result<Self, FetchAtHeightError> {
+        let bytes = node
+            .get_block_raw(HashOrHeight::Height(block::Height(height)))
+            .await
+            .map_err(BlockAtHeightError::from)?
+            .0;
+        Ok(BlockingTask::spawn(move || Self::from_bytes_at_height(bytes, height)).join().await??)
     }
 
     /// Decodes `bytes` with [`Self::from_bytes`], and refuses a block that is not at `height`.

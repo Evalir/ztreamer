@@ -123,9 +123,8 @@ impl Epoch<'_> {
                     let expected = expected.encode()?;
                     Ok(record.encode().is_ok_and(|bytes| bytes == expected))
                 })
-                .join()
+                .join_flattened()
                 .await
-                .map_err(|cancelled| node(cancelled.into()))?
                 .map_err(node)?;
                 if !same {
                     return Err(Check::SampledBlock.at(height).into());
