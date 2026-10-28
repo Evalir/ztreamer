@@ -21,6 +21,7 @@ use zakura_chain::{block, subtree::NoteCommitmentSubtreeIndex};
 use zakura_rpc::client::Commitments;
 use zakura_state::HashOrHeight;
 use ztreamer_indexer::{
+    blocking::BlockingTaskCancelled,
     codec::CodecError,
     frontier::{FromRpc, RpcDecodeError},
     index::range_meta::{Attested, NodeBytes, Pool, PoolRoots, SubtreeNode},
@@ -92,6 +93,9 @@ pub enum NodeError {
     /// The record of the node block does not encode.
     #[error("record of the node block does not encode")]
     Encode(#[from] CodecError),
+    /// The blocking pool stopped before a blocking task of the call ran.
+    #[error(transparent)]
+    Cancelled(#[from] BlockingTaskCancelled),
 }
 
 impl From<BlockAtHeightError> for NodeError {
@@ -100,6 +104,7 @@ impl From<BlockAtHeightError> for NodeError {
             BlockAtHeightError::Rpc(error) => Self::Rpc(error),
             BlockAtHeightError::Decode { source, .. } => Self::RawBlock(source),
             BlockAtHeightError::Height { expected, actual } => Self::Height { expected, actual },
+            BlockAtHeightError::Cancelled(error) => Self::Cancelled(error),
         }
     }
 }

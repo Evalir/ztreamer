@@ -6,6 +6,7 @@ use ztreamer_node::NodeClient;
 use ztreamer_remote::RpcError;
 
 use crate::{
+    blocking::BlockingTaskCancelled,
     codec::CompactBlockRecord,
     index::{BlockId, Index, IndexError, IndexState, PERSIST_DEPTH, SEAL_DEPTH},
     ingest::{IngestError, OrderedBuilder},
@@ -39,6 +40,9 @@ pub enum HeadError {
     Window,
     #[error(transparent)]
     Parse(#[from] CompactParseError),
+    /// The blocking pool stopped before a blocking task of the poll ran.
+    #[error(transparent)]
+    Cancelled(#[from] BlockingTaskCancelled),
 }
 
 impl From<RawBlockError> for HeadError {
@@ -53,6 +57,7 @@ impl From<BlockAtHeightError> for HeadError {
             BlockAtHeightError::Rpc(error) => Self::Remote(error),
             BlockAtHeightError::Decode { source, .. } => source.into(),
             BlockAtHeightError::Height { expected, actual } => Self::Height { expected, actual },
+            BlockAtHeightError::Cancelled(error) => Self::Cancelled(error),
         }
     }
 }

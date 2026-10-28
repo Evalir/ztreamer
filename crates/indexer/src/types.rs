@@ -1,6 +1,6 @@
 //! Compact block and transaction types produced by the parser and stored by the index.
 
-use std::{io, panic};
+use std::io;
 
 use zakura_chain::{
     block::{self, Block},
@@ -12,6 +12,7 @@ use ztreamer_remote::{RpcError, ZakuraClient};
 
 use crate::{
     Ciphertext, Digest, EphemeralKey,
+    blocking::{BlockingTask, BlockingTaskCancelled},
     codec::{CompactBlockRecord, TreeSizes},
 };
 
@@ -52,6 +53,9 @@ pub enum BlockAtHeightError {
     /// The block for height `expected` has the coinbase height `actual`.
     #[error("block for height {expected} is at height {actual}")]
     Height { expected: u32, actual: u32 },
+    /// The blocking pool stopped before the decode ran.
+    #[error(transparent)]
+    Cancelled(#[from] BlockingTaskCancelled),
 }
 
 impl RawIndexBlock {
@@ -62,9 +66,7 @@ impl RawIndexBlock {
         height: u32,
     ) -> Result<Self, BlockAtHeightError> {
         let bytes = node.get_block_raw(HashOrHeight::Height(block::Height(height))).await?.0;
-        tokio::task::spawn_blocking(move || Self::from_bytes_at_height(bytes, height))
-            .await
-            .unwrap_or_else(|error| panic::resume_unwind(error.into_panic()))
+        BlockingTask::spawn(move || Self::from_bytes_at_height(bytes, height)).join().await?
     }
 
     /// Decodes `bytes` with [`Self::from_bytes`], and refuses a block that is not at `height`.

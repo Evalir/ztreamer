@@ -24,6 +24,7 @@ use zakura_chain::block::{self, Height};
 use ztreamer_remote::RpcError;
 
 use crate::{
+    blocking::BlockingTaskCancelled,
     index::{Index, IndexError, IndexState},
     ingest::{
         EncodedBatch, IngestError, OrderedBuilder, WriteBatch, partial_range_flush_threshold,
@@ -148,6 +149,9 @@ pub enum PipelineError {
     Worker,
     #[error("pipeline worker panicked")]
     Panic,
+    /// The blocking pool stopped before a blocking task of the pass ran.
+    #[error(transparent)]
+    Cancelled(#[from] BlockingTaskCancelled),
 }
 
 impl From<BlockAtHeightError> for PipelineError {
@@ -158,6 +162,7 @@ impl From<BlockAtHeightError> for PipelineError {
             BlockAtHeightError::Height { expected, actual } => {
                 Self::SourceGap { expected, actual: Some(actual) }
             }
+            BlockAtHeightError::Cancelled(error) => Self::Cancelled(error),
         }
     }
 }

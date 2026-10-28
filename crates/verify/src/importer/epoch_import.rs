@@ -2,7 +2,6 @@
 
 use std::{
     ops::Range,
-    panic,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,9 +10,12 @@ use bytes::Bytes;
 use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use tokio::sync::Semaphore;
 use tracing::Span;
-use ztreamer_indexer::index::{
-    CheckedRange, IndexState,
-    range_meta::{Frontiers, MAX_RANGES, ManifestEntry, RangeMeta, VerifyState},
+use ztreamer_indexer::{
+    blocking::BlockingTask,
+    index::{
+        CheckedRange, IndexState,
+        range_meta::{Frontiers, MAX_RANGES, ManifestEntry, RangeMeta, VerifyState},
+    },
 };
 
 use super::{ImportError, Importer, MAX_BLOB_BYTES_BEFORE_INSTALL};
@@ -138,9 +140,7 @@ impl EpochImport {
         let _permit =
             self.verify_permits.acquire().await.expect("the verify permits are never closed");
         let (run, span) = (Arc::clone(self), Span::current());
-        tokio::task::spawn_blocking(move || span.in_scope(|| run.verify_blobs(at, blobs)))
-            .await
-            .unwrap_or_else(|error| panic::resume_unwind(error.into_panic()))
+        BlockingTask::spawn(move || span.in_scope(|| run.verify_blobs(at, blobs))).join().await?
     }
 
     /// Runs [`Epoch::verify`] for the epoch at `at`, and gives the checked range of each blob.

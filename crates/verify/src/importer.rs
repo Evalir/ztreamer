@@ -46,15 +46,18 @@
 
 mod epoch_import;
 
-use std::{future, num::NonZeroUsize, panic, pin, sync::Arc, thread};
+use std::{future, num::NonZeroUsize, pin, sync::Arc, thread};
 
 use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use tokio::sync::{Semaphore, watch};
 use tracing::{Instrument as _, info};
 use zakura_chain::{block, parameters::Network};
-use ztreamer_indexer::index::{
-    Index, IndexError, IndexState, RANGE_SIZE,
-    range_meta::{Frontiers, NodeId},
+use ztreamer_indexer::{
+    blocking::{BlockingTask, BlockingTaskCancelled},
+    index::{
+        Index, IndexError, IndexState, RANGE_SIZE,
+        range_meta::{Frontiers, NodeId},
+    },
 };
 
 use self::epoch_import::EpochImport;
@@ -147,6 +150,9 @@ pub enum ImportError {
     /// An index read or install failed.
     #[error(transparent)]
     Index(#[from] IndexError),
+    /// The blocking pool stopped before a blocking task of the import ran.
+    #[error(transparent)]
+    Cancelled(#[from] BlockingTaskCancelled),
     /// The manifest is for another network.
     #[error("manifest is for network {manifest}, the index for {index}")]
     Network {
@@ -344,9 +350,7 @@ impl Importer {
         call: impl FnOnce(&Index) -> Result<T, IndexError> + Send + 'static,
     ) -> Result<T, ImportError> {
         let index = Arc::clone(&self.index);
-        Ok(tokio::task::spawn_blocking(move || call(&index))
-            .await
-            .unwrap_or_else(|error| panic::resume_unwind(error.into_panic()))?)
+        Ok(BlockingTask::spawn(move || call(&index)).join().await??)
     }
 }
 

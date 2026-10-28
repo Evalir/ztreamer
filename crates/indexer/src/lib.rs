@@ -4,6 +4,7 @@
 #![allow(missing_docs)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub mod blocking;
 pub mod codec;
 pub mod frontier;
 pub mod head;
